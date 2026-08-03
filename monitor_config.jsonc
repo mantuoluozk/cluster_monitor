@@ -1,0 +1,81 @@
+{
+  // 模型名称：用于本轮结果目录名称；也可用 --model 临时覆盖。
+  "model_name": "example-model",
+
+  // 部署模式可选 PD 或 IFB（不区分大小写）。
+  // mode="PD" 时只使用 P、D 数组；mode="IFB" 时只使用 IFB 数组，另一种模式的节点会被忽略。
+  // 节点名必须能从跳板机直接 ssh；同一个生效分组中不要重复填写节点。
+  "deployment": {
+    "mode": "PD",
+    "groups": {
+      "P": ["p1c0", "p1c1"],
+      "D": ["p1c2", "p1c3"],
+      // 使用 IFB 方案时，把 mode 改为 "IFB"，并在下面填写本次使用的所有计算节点。
+      "IFB": []
+    }
+  },
+
+  // 每个计算节点预期有 4 张 DCU；数量不符时终端打印警告，但仍继续记录已有卡。
+  "expected_dcu_cards_per_node": 4,
+
+  // 0=持续记录直到 Ctrl+C；大于0=启动后记录指定秒数并自动结束。
+  // 端口状态不会控制采集开始或结束。
+  "monitor_duration_s": 0,
+
+  // 路由端口只做状态标记，不参与启动、停止或数据筛选。
+  // 使用前将 enabled 改为 true，并填写从跳板机能够访问的路由主机和业务端口。
+  "route_probe": {
+    "enabled": false,
+    "host": "p1c0",
+    "port": 8000,
+    "interval_s": 1,                  // TCP 探测间隔，秒
+    "connect_timeout_s": 0.5,         // 单次 TCP 连接超时，秒
+    "successes_to_reachable": 1,      // 连续成功多少次确认“可访问”
+    "failures_to_unreachable": 3      // 连续失败多少次确认“不可访问”，避免瞬时抖动
+  },
+
+  // 基础采样周期。CPU、主机内存、IB、DCU利用率和DCU功耗每个周期采集一次。
+  "sample_interval_s": 2,
+
+  // 较慢或变化较慢的指标使用独立刷新周期；中间样本复用最近一次成功值。
+  "dcu_memory_interval_s": 10,       // 显存容量与占用量刷新周期
+  "dcu_utilization_interval_s": 10,  // 最近1秒 active ratio 命令约耗时4秒，在独立SSH中运行，不阻塞基础采样
+  "dcu_temperature_interval_s": 5,  // 四类 DCU 温度刷新周期
+  "node_power_interval_s": 5,
+  "cpu_power_interval_s": 5,
+  "cpu_temperature_interval_s": 5,
+
+  // 计算节点采集命令。
+  // 主命令主要读取 Average Graphics Package Power 等卡信息；其中瞬时 HCU use 不写入结果。
+  "dcu_command": "hy-smi --showuse --showmemuse --showpower --json",
+  // 最近1秒 active ratio 用作主要利用率，避免瞬时采样漏掉推理脉冲。
+  "dcu_utilization_command": "hy-smi --showhcuutil",
+  "dcu_memory_command": "hy-smi --showmeminfo vram --json",
+  "dcu_temperature_command": "hy-smi --showtemp --json",
+  "node_power_command": "ipmitool dcmi power reading",
+
+  // 当前机型从 BMC 的 CPU_POWER 传感器读取 CPU 总功耗，单位 W。
+  "cpu_power_command": "sudo ipmitool sensor get CPU_POWER | awk '/Sensor Reading/ {print $4; exit}'",
+
+  // auto 从 k10temp/CPU/Package/Tctl/Tdie 等 hwmon 传感器计算平均与最高温度。
+  "cpu_temperature_command": "auto",
+
+  // 从跳板机连接每个计算节点时使用的 SSH 参数。
+  "ssh_options": [
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=8",
+    "-o", "ServerAliveInterval=15"
+  ]
+
+  // ==================== 常用运行与结果查看方式 ====================
+  // 常用运行方式：命令行的 --model 会覆盖上面的 model_name，并用于结果目录名称。
+  // cd /path/to/cluster_monitor
+  // python3 cluster_monitor.py --model DeepSeek-V3
+  //
+  // 查看方式 1：用 SCP/SFTP 下载项目 results/ 下对应的整个结果文件夹，
+  //             然后在本地直接打开该文件夹中的 dashboard.html。不能只下载 HTML，否则 SVG 无法加载。
+  //
+  // 查看方式 2：不下载结果。在 Windows 本地终端运行下面的 SSH 隧道命令，并保持终端运行：
+  // ssh -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && python3 -m http.server 18080 --bind 127.0.0.1"
+  // 然后浏览器打开 http://127.0.0.1:18080/；按 Ctrl+C 可停止结果服务和隧道。
+}
