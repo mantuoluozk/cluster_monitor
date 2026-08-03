@@ -110,9 +110,11 @@ python3 cluster_monitor.py --model DeepSeek-V3 --duration 600
 ```text
 results/DeepSeek-V3_run_YYYYMMDD_HHMMSS/
 ├── dashboard.html              # 单页可视化入口
-├── summary.csv                 # 仅统计稳态区间
+├── summary.csv                 # 统一稳态汇总，兼容旧版名称
+├── shared_summary.csv          # 所有节点使用同一稳态区间
+├── per_node_summary.csv        # 每个节点使用自己的稳态区间
 ├── full_summary.csv            # 完整生命周期汇总
-├── steady_state.json           # 稳态判断结果与真实利用率样本
+├── steady_state.json           # 统一/每节点稳态结果与真实利用率样本
 ├── route_events.csv            # 端口状态事件
 ├── effective_config.json       # 本次实际配置
 ├── run_metadata.json
@@ -120,9 +122,12 @@ results/DeepSeek-V3_run_YYYYMMDD_HHMMSS/
 │   └── p1c0/
 │       ├── host.csv            # CPU、内存、整机数据
 │       ├── dcu_cards.csv       # 四张DCU逐卡数据
-│       ├── summary.csv         # 该节点稳态汇总
+│       ├── summary.csv         # 该节点统一稳态汇总，兼容旧版
+│       ├── shared_summary.csv
+│       ├── per_node_summary.csv
 │       ├── full_summary.csv    # 该节点全程汇总
-│       └── visualization.svg
+│       ├── visualization.svg   # 统一稳态区间曲线
+│       └── visualization_per_node.svg
 └── D/...
 ```
 
@@ -130,7 +135,7 @@ IFB 模式会生成 `IFB/` 目录。
 
 仪表盘分为三部分：
 
-1. 全节点稳态平均值/最大值汇总表
+1. 可在“统一稳态区间”和“每节点独立区间”之间切换的平均值/最大值汇总表
 2. 跨节点关键指标对比
 3. 可切换节点的完整时间曲线
 
@@ -166,15 +171,17 @@ http://127.0.0.1:18080/
 
 ## 稳态判断与统计口径
 
-- 一键开关位于 `steady_state.enabled`：设为 `true` 时启用稳态判断；设为 `false` 时关闭判断，`summary.csv` 和 HTML 自动改为统计脚本全程。只需修改这一项，其他稳态参数可以保留不动。
+- 一键开关位于 `steady_state.enabled`：设为 `true` 时同时计算统一稳态和每节点独立稳态；设为 `false` 时关闭判断，两种口径都使用脚本全程。只需修改这一项，其他稳态参数可以保留不动。
 - 原始 `host.csv`、`dcu_cards.csv` 始终保留脚本开始到结束的全部数据。
-- PD模式默认使用D节点，IFB模式默认使用IFB节点作为稳态判断参考。
+- 统一口径：PD模式默认使用全部D节点，IFB模式默认使用全部IFB节点形成一条参考曲线，并把同一区间用于所有节点。
+- 独立口径：每个节点使用自己的四卡平均DCU利用率单独判断，因此各节点的开始和结束时间可以不同。
 - 判断只使用 `hy-smi --showhcuutil` 真正刷新的样本，不把中间复用的缓存值重复计数。
 - 默认最近6个真实样本组成窗口，比较前后半段均值；连续2次变化不超过10%后确认稳态。
 - 确认后向前回溯到第一个稳定样本，因此统计起点不是确认时刻。
 - 连续2个真实样本低于2%后确认结束，再回溯到下降前最后一个稳定样本。
-- `summary.csv` 和 HTML 汇总只使用稳态区间；`full_summary.csv` 保留完整生命周期统计。
-- CSV 的 `phase` 会标记 `before_steady`、`steady`、`after_steady` 或 `not_detected`。
+- HTML顶部按钮会同时切换汇总表、跨节点比较和曲线中的紫色稳态区域，不需要修改JSONC或重新运行模型。
+- `summary.csv` 与 `shared_summary.csv` 使用统一口径；`per_node_summary.csv` 使用独立口径；`full_summary.csv` 保留完整生命周期统计。
+- 原始CSV的 `phase`/`shared_phase` 标记统一口径，`node_phase` 标记该节点的独立口径，取值包括 `before_steady`、`steady`、`after_steady` 或 `not_detected`。
 - 缺失值不会按 0 参与计算。
 - 路由端口事件只做标记，不裁剪统计区间。
 - DCU 利用率只采用 `hy-smi --showhcuutil` 的最近1秒 HCU active ratio。
@@ -195,7 +202,7 @@ http://127.0.0.1:18080/
 | `cpu_power_interval_s` | CPU 功耗刷新周期 |
 | `node_power_interval_s` | 整机功耗刷新周期 |
 | `ssh_options` | 跳板机连接计算节点的 SSH 参数 |
-| `steady_state.enabled` | 稳态判断总开关：`true` 开启，`false` 关闭并使用全程统计 |
+| `steady_state.enabled` | 稳态判断总开关：`true` 同时计算两种口径，`false` 两种口径都使用全程统计 |
 | `steady_state.window_fresh_samples` | 稳态窗口包含的真实利用率样本数 |
 | `steady_state.confirm_windows` | 连续满足多少次后确认稳态 |
 | `steady_state.idle_confirm_samples` | 连续多少个空闲样本后确认结束 |

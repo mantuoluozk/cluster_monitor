@@ -1050,14 +1050,14 @@ def legacy_main():
 
 
 HOST_FIELDS = [
-    "timestamp","node_timestamp","node_clock_offset_s","elapsed_s","role","node","route_state","route_event","phase",
+    "timestamp","node_timestamp","node_clock_offset_s","elapsed_s","role","node","route_state","route_event","phase","shared_phase","node_phase",
     "cpu_util_pct","cpu_user_pct","cpu_system_pct","cpu_iowait_pct","cpu_freq_avg_mhz","cpu_freq_max_mhz",
     "cpu_temp_avg_c","cpu_temp_max_c","cpu_power_w",
     "host_mem_used_gib","host_mem_total_gib","host_mem_util_pct","node_power_w","error",
 ]
 
 NODE_DCU_FIELDS = [
-    "timestamp","node_timestamp","node_clock_offset_s","elapsed_s","role","node","route_state","route_event","phase","dcu_index",
+    "timestamp","node_timestamp","node_clock_offset_s","elapsed_s","role","node","route_state","route_event","phase","shared_phase","node_phase","dcu_index",
     "dcu_util_pct","dcu_util_sample_age_s","dcu_mem_used_gib","dcu_mem_total_gib","dcu_mem_util_pct",
     "dcu_power_w","dcu_temp_c","dcu_temp_edge_c","dcu_temp_junction_c","dcu_temp_mem_c","dcu_temp_core_c","error",
 ]
@@ -1210,17 +1210,43 @@ def detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed):
     return result
 
 
-def mark_phases(host_rows,dcu_rows,steady):
-    start=steady.get("start_elapsed_s"); end=steady.get("end_elapsed_s"); disabled=steady.get("status")=="disabled_full_run"
+def detect_node_steady_states(cfg,roles,dcu_rows,total_elapsed):
+    """每个节点使用自己的四卡平均利用率，独立计算稳态区间。"""
+    results={}
+    for node,role in roles.items():
+        node_cfg={**cfg,"steady_state":{**cfg.get("steady_state",{}),"reference_group":"NODE"}}
+        result=detect_steady_state(node_cfg,"NODE",{"NODE":[node]},{node:dcu_rows.get(node,[])},total_elapsed)
+        result.update({"scope":"per_node","node":node,"role":role,"reference_group":role,"reference_nodes":[node]})
+        results[node]=result
+    return results
+
+
+def _phase_for_elapsed(elapsed,steady):
+    start=steady.get("start_elapsed_s"); end=steady.get("end_elapsed_s")
+    if steady.get("status")=="disabled_full_run":return "steady"
+    if start is None or end is None:return "not_detected"
+    if elapsed<start:return "before_steady"
+    if elapsed<=end:return "steady"
+    return "after_steady"
+
+
+def mark_phases(host_rows,dcu_rows,steady,field="phase"):
     for rows_by_node in (host_rows,dcu_rows):
         for rows in rows_by_node.values():
             for row in rows:
                 elapsed=float(row.get("elapsed_s",0))
-                if disabled:row["phase"]="steady"
-                elif start is None or end is None:row["phase"]="not_detected"
-                elif elapsed<start:row["phase"]="before_steady"
-                elif elapsed<=end:row["phase"]="steady"
-                else:row["phase"]="after_steady"
+                row[field]=_phase_for_elapsed(elapsed,steady)
+
+
+def mark_node_phases(host_rows,dcu_rows,node_steady):
+    for node,steady in node_steady.items():
+        for rows_by_node in (host_rows,dcu_rows):
+            for row in rows_by_node.get(node,[]):
+                row["node_phase"]=_phase_for_elapsed(float(row.get("elapsed_s",0)),steady)
+
+
+def steady_rows(rows,steady):
+    return [row for row in rows if _phase_for_elapsed(float(row.get("elapsed_s",0)),steady)=="steady"]
 
 
 def build_node_summary(role,node,host_rows,dcu_rows):
@@ -1287,7 +1313,9 @@ def make_node_svg(path,model,role,node,host_rows,dcu_rows,events,started,steady=
     out.append('<rect width="100%%" height="100%%" fill="#ffffff"/>')
     out.append('<style>text{font-family:Arial,"Microsoft YaHei",sans-serif;fill:#1f2937}.axis{stroke:#9ca3af;stroke-width:1}.grid{stroke:#e5e7eb;stroke-width:1}.series{fill:none;stroke-width:1.8}.event{stroke-width:1.4;stroke-dasharray:5 4}.steady-boundary{stroke:#7c3aed;stroke-width:1.6;stroke-dasharray:7 4}.steady-zone{fill:#ede9fe;opacity:.45}</style>')
     out.append('<text x="%d" y="34" font-size="24" font-weight="700">%s / %s / %s</text>'%(left,html.escape(model),html.escape(role),html.escape(node)))
-    out.append('<text x="%d" y="62" font-size="13">Purple band: steady state; green/red lines: route reachable/unreachable. Legends show steady average / maximum.</text>'%left)
+    scope_label="node-specific steady interval" if steady and steady.get("scope")=="per_node" else "shared steady interval"
+    if steady and steady.get("status")=="disabled_full_run":scope_label="full run (steady detection disabled)"
+    out.append('<text x="%d" y="62" font-size="13">Purple band: %s; green/red lines: route reachable/unreachable. Legends show selected average / maximum.</text>'%(left,scope_label))
     for pi,(title,unit,series) in enumerate(panels):
         y0=top+pi*panel_h; plot_top=y0+28; plot_bottom=y0+160; plot_h=plot_bottom-plot_top
         values=[float(v) for _,_,points in series for _,v in points if v not in (None,"")]
@@ -1357,12 +1385,15 @@ def _dashboard_node_metrics(host_rows,dcu_rows):
     return result
 
 
-def make_dashboard(path,model,node_infos,host_rows,dcu_rows,steady=None):
+def make_dashboard(path,model,node_infos,shared_host,shared_dcu,node_host,node_dcu,shared_steady,node_steady):
     role_order=[]; overview=[]
-    for role,node,relative_svg in node_infos:
+    for role,node,shared_svg,node_svg in node_infos:
         if role not in role_order:role_order.append(role)
-        overview.append({"role":role,"node":node,"svg":relative_svg,
-                         "metrics":_dashboard_node_metrics(host_rows.get(node,[]),dcu_rows.get(node,[]))})
+        overview.append({"role":role,"node":node,"shared_svg":shared_svg,"node_svg":node_svg,
+                         "metrics":{
+                             "shared":_dashboard_node_metrics(shared_host.get(node,[]),shared_dcu.get(node,[])),
+                             "per-node":_dashboard_node_metrics(node_host.get(node,[]),node_dcu.get(node,[])),
+                         }})
     metric_defs=[
         ("cpu_util","CPU利用率","%"),("cpu_temp","CPU温度","°C"),("cpu_power","CPU功耗","W"),
         ("memory_used","内存占用","GiB"),("memory_util","内存利用率","%"),
@@ -1375,24 +1406,31 @@ def make_dashboard(path,model,node_infos,host_rows,dcu_rows,steady=None):
     for item in overview:
         cells=[]
         for key,_,_ in metric_defs:
-            avg,maximum=item["metrics"].get(key,(None,None))
-            cells.append('<td><span class="avg">%s</span><span class="max">%s</span></td>'%(number(avg),number(maximum)))
+            scope_values=[]
+            for scope in ("shared","per-node"):
+                avg,maximum=item["metrics"][scope].get(key,(None,None))
+                scope_values.append('<span class="scope-content" data-scope="%s"><span class="avg">%s</span><span class="max">%s</span></span>'%
+                                    (scope,number(avg),number(maximum)))
+            cells.append('<td>%s</td>'%"".join(scope_values))
         table_rows.append('<tr><th><span class="role role-%s">%s</span> %s</th>%s</tr>'%
                           (html.escape(item["role"].lower()),html.escape(item["role"]),html.escape(item["node"]),"".join(cells)))
     comparison_defs=[definition for definition in metric_defs if definition[0] in
                      ("cpu_util","cpu_power","memory_util","dcu_util","vram_util","dcu_power_total","node_power")]
     comparison_cards=[]
     for key,label,unit in comparison_defs:
-        scale=max([item["metrics"].get(key,(None,None))[1] or 0 for item in overview]+[1])
-        rows=[]
-        for item in overview:
-            avg,maximum=item["metrics"].get(key,(None,None)); avg_width=0 if avg is None else min(100,avg*100/scale)
-            max_left=0 if maximum is None else min(100,maximum*100/scale)
-            rows.append('''<div class="bar-row"><span class="bar-node"><i class="role-dot role-%s"></i>%s</span><div class="bar-track"><span class="bar-fill role-bg-%s" style="width:%.3f%%"></span>%s</div><span class="bar-value">%s / %s</span></div>'''%
-                        (html.escape(item["role"].lower()),html.escape(item["node"]),html.escape(item["role"].lower()),avg_width,
-                         "" if maximum is None else '<i class="maximum-marker" style="left:%.3f%%"></i>'%max_left,number(avg),number(maximum)))
+        scope_blocks=[]
+        for scope in ("shared","per-node"):
+            scale=max([item["metrics"][scope].get(key,(None,None))[1] or 0 for item in overview]+[1])
+            rows=[]
+            for item in overview:
+                avg,maximum=item["metrics"][scope].get(key,(None,None)); avg_width=0 if avg is None else min(100,avg*100/scale)
+                max_left=0 if maximum is None else min(100,maximum*100/scale)
+                rows.append('''<div class="bar-row"><span class="bar-node"><i class="role-dot role-%s"></i>%s</span><div class="bar-track"><span class="bar-fill role-bg-%s" style="width:%.3f%%"></span>%s</div><span class="bar-value">%s / %s</span></div>'''%
+                            (html.escape(item["role"].lower()),html.escape(item["node"]),html.escape(item["role"].lower()),avg_width,
+                             "" if maximum is None else '<i class="maximum-marker" style="left:%.3f%%"></i>'%max_left,number(avg),number(maximum)))
+            scope_blocks.append('<div class="scope-content" data-scope="%s">%s</div>'%(scope,"".join(rows)))
         comparison_cards.append('<article class="compare-card"><h3>%s <small>%s</small></h3><div class="compare-legend">平均值条形 · <b>◆</b> 最大值</div>%s</article>'%
-                                (html.escape(label),html.escape(unit),"".join(rows)))
+                                (html.escape(label),html.escape(unit),"".join(scope_blocks)))
     role_buttons=[]; node_tab_groups=[]; detail_panels=[]
     for role in role_order:
         role_items=[item for item in overview if item["role"]==role]
@@ -1401,31 +1439,39 @@ def make_dashboard(path,model,node_infos,host_rows,dcu_rows,steady=None):
         for item in role_items:
             detail_id="detail-%d"%overview.index(item)
             node_buttons.append('<button type="button" class="node-tab" data-detail="%s">%s</button>'%(detail_id,html.escape(item["node"])))
-            detail_panels.append('''<article id="%s" class="detail-panel" data-role="%s"><div class="detail-title"><div><span class="role role-%s">%s</span><h3>%s 完整时间曲线</h3></div><a href="%s" target="_blank">打开原尺寸 SVG</a></div><img src="%s" loading="lazy" alt="%s %s monitoring chart"></article>'''%
-                                 (detail_id,html.escape(role),html.escape(role.lower()),html.escape(role),html.escape(item["node"]),
-                                  html.escape(item["svg"]),html.escape(item["svg"]),html.escape(role),html.escape(item["node"])))
+            scoped_images=[]
+            for scope,svg in (("shared",item["shared_svg"]),("per-node",item["node_svg"])):
+                scoped_images.append('''<div class="scope-content chart-scope" data-scope="%s"><a class="svg-link" href="%s" target="_blank">打开原尺寸 SVG</a><img src="%s" loading="lazy" alt="%s %s monitoring chart"></div>'''%
+                                     (scope,html.escape(svg),html.escape(svg),html.escape(role),html.escape(item["node"])))
+            detail_panels.append('''<article id="%s" class="detail-panel" data-role="%s"><div class="detail-title"><div><span class="role role-%s">%s</span><h3>%s 完整时间曲线</h3></div></div>%s</article>'''%
+                                 (detail_id,html.escape(role),html.escape(role.lower()),html.escape(role),html.escape(item["node"]),"".join(scoped_images)))
         node_tab_groups.append('<div class="node-tabs" data-role="%s">%s</div>'%(html.escape(role),"".join(node_buttons)))
-    if steady and steady.get("status")=="disabled_full_run":
-        steady_summary="稳态判断已禁用；汇总使用脚本完整运行区间"
-    elif steady and steady.get("start_elapsed_s") is not None:
-        end_note="已确认" if steady.get("end_confirmed") else "未确认"
-        steady_summary="稳态 %.1fs–%.1fs · 持续 %.1fs · 参考组 %s · 结束%s"%(
-            steady["start_elapsed_s"],steady["end_elapsed_s"],steady.get("duration_s",0),steady.get("reference_group","--"),end_note)
-    else:steady_summary="未检测到稳态区间；稳态汇总不使用全程数据代替"
+    def describe_steady(steady,prefix):
+        if steady and steady.get("status")=="disabled_full_run":return "稳态判断已禁用；两种口径均使用脚本完整运行区间"
+        if steady and steady.get("start_elapsed_s") is not None:
+            end_note="已确认" if steady.get("end_confirmed") else "未确认"
+            return "%s %.1fs–%.1fs · 持续 %.1fs · 结束%s"%(prefix,steady["start_elapsed_s"],steady["end_elapsed_s"],steady.get("duration_s",0),end_note)
+        return "%s未检测到稳态；汇总保持为空"%prefix
+    shared_summary=describe_steady(shared_steady,"统一稳态")
+    detected=sum(1 for result in node_steady.values() if result.get("start_elapsed_s") is not None)
+    node_summary=("稳态判断已禁用；两种口径均使用脚本完整运行区间" if shared_steady.get("status")=="disabled_full_run" else
+                  "每节点独立稳态 · 已检测 %d/%d 个节点；各节点使用自己的时间区间"%(detected,len(node_steady)))
     replacements={
         "__TITLE__":html.escape(model),"__NODE_COUNT__":str(len(overview)),"__ROLE_BUTTONS__":"".join(role_buttons),
         "__TABLE_HEADER__":header,"__TABLE_ROWS__":"".join(table_rows),"__COMPARE_CARDS__":"".join(comparison_cards),
-        "__NODE_TABS__":"".join(node_tab_groups),"__DETAIL_PANELS__":"".join(detail_panels),"__STEADY_SUMMARY__":html.escape(steady_summary),
+        "__NODE_TABS__":"".join(node_tab_groups),"__DETAIL_PANELS__":"".join(detail_panels),
+        "__SHARED_SUMMARY__":html.escape(shared_summary),"__NODE_SUMMARY__":html.escape(node_summary),
     }
     doc='''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>__TITLE__ 监控总览</title>
 <style>
-:root{--ink:#0b1f33;--muted:#5b7083;--line:#cbd8e4;--paper:#f4f7fa;--panel:#fff;--blue:#1769aa;--cyan:#008f95;--orange:#e05a24;--green:#16845b;--purple:#7857a8}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:"Microsoft YaHei UI","Microsoft YaHei",Arial,sans-serif}.page{width:min(1680px,100%);margin:auto;padding:20px 24px 44px}.masthead{display:flex;justify-content:space-between;gap:24px;align-items:flex-end;padding:22px 0 18px;border-bottom:3px solid var(--ink)}.eyebrow{font:700 12px Consolas,monospace;letter-spacing:.16em;color:var(--cyan)}h1{font-size:30px;margin:6px 0 0}.masthead p{margin:0;color:var(--muted)}.anchor-nav{position:sticky;top:0;z-index:8;display:flex;gap:8px;padding:10px 0;background:rgba(244,247,250,.96);border-bottom:1px solid var(--line)}.anchor-nav a{padding:7px 11px;color:var(--blue);text-decoration:none;font-weight:700}.section{margin-top:28px}.section-head{display:flex;justify-content:space-between;align-items:end;gap:20px;margin-bottom:12px}.section h2{font-size:21px;margin:0}.section-head p{margin:0;color:var(--muted);font-size:13px}.table-wrap{overflow:auto;background:var(--panel);border:1px solid var(--line)}table{width:100%;min-width:1450px;border-collapse:collapse;font:13px Consolas,"Microsoft YaHei UI",monospace}th,td{padding:10px 9px;border-bottom:1px solid #e5edf3;text-align:right;white-space:nowrap}thead th{position:sticky;top:0;background:#eaf1f6;color:#243c50}thead th:first-child,tbody th{text-align:left;position:sticky;left:0;background:#fff;z-index:2}thead th:first-child{z-index:3;background:#eaf1f6}th small{display:block;color:var(--muted);font-weight:400}.avg{color:var(--ink)}.max{color:var(--orange);margin-left:7px}.max:before{content:"/ ";color:#9aa9b5}.role{display:inline-grid;place-items:center;min-width:34px;padding:3px 7px;margin-right:6px;border-radius:3px;color:#fff;font:700 12px Consolas,monospace}.role-p,.role-bg-p{background:var(--blue)}.role-d,.role-bg-d{background:var(--cyan)}.role-ifb,.role-bg-ifb{background:var(--purple)}.compare-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.compare-card{background:#fff;border:1px solid var(--line);padding:15px}.compare-card h3{margin:0;font-size:16px}.compare-card h3 small{color:var(--muted)}.compare-legend{margin:4px 0 12px;color:var(--muted);font-size:11px}.compare-legend b{color:var(--orange)}.bar-row{display:grid;grid-template-columns:92px minmax(120px,1fr) 112px;gap:9px;align-items:center;margin:8px 0;font:12px Consolas,monospace}.bar-node{overflow:hidden;text-overflow:ellipsis}.role-dot{display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%}.role-dot.role-p{background:var(--blue)}.role-dot.role-d{background:var(--cyan)}.role-dot.role-ifb{background:var(--purple)}.bar-track{height:13px;background:#e7eef3;position:relative}.bar-fill{display:block;height:100%;min-width:1px}.maximum-marker{position:absolute;top:-3px;transform:translateX(-50%);color:var(--orange)}.maximum-marker:after{content:"◆";font-style:normal;font-size:13px}.bar-value{text-align:right;color:#334e62}.detail-controls{background:#eaf1f6;border:1px solid var(--line);padding:12px}.role-tabs,.node-tabs{display:flex;flex-wrap:wrap;gap:8px}.node-tabs{margin-top:9px}.role-tab,.node-tab{appearance:none;border:1px solid #9fb2c1;background:#fff;color:var(--ink);padding:7px 12px;cursor:pointer;font:700 13px "Microsoft YaHei UI",sans-serif}.role-tab.active,.node-tab.active{background:var(--ink);border-color:var(--ink);color:#fff}.role-tab:focus-visible,.node-tab:focus-visible,a:focus-visible{outline:3px solid #f3a45f;outline-offset:2px}.detail-panel{display:none;margin-top:12px;background:#fff;border:1px solid var(--line);padding:14px}.detail-panel.active{display:block}.detail-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.detail-title>div{display:flex;align-items:center}.detail-title h3{display:inline;margin:0;font-size:18px}.detail-title a{color:var(--blue);font-weight:700;text-decoration:none}.detail-panel img{display:block;width:100%;height:auto;border:1px solid #e3ebf1}footer{margin-top:24px;color:var(--muted);font-size:12px}@media(max-width:900px){.page{padding:12px}.masthead{display:block}.masthead p{margin-top:9px}.compare-grid{grid-template-columns:1fr}.section-head{display:block}.section-head p{margin-top:5px}.bar-row{grid-template-columns:76px 1fr 92px}.detail-title{align-items:flex-start;gap:10px}}
-</style></head><body><main class="page"><header class="masthead"><div><span class="eyebrow">SUPERNODE RESOURCE REPORT</span><h1>__TITLE__ 监控总览</h1></div><p>__NODE_COUNT__ 个计算节点<br>__STEADY_SUMMARY__</p></header><nav class="anchor-nav"><a href="#overview">节点汇总</a><a href="#compare">跨节点比较</a><a href="#details">时间曲线</a></nav>
-<section id="overview" class="section"><div class="section-head"><h2>稳态节点汇总矩阵</h2><p>仅统计稳态区间；表中为平均值 / 最大值，橙色数字表示最大值</p></div><div class="table-wrap"><table><thead><tr><th>角色 / 节点</th>__TABLE_HEADER__</tr></thead><tbody>__TABLE_ROWS__</tbody></table></div></section>
+:root{--ink:#0b1f33;--muted:#5b7083;--line:#cbd8e4;--paper:#f4f7fa;--panel:#fff;--blue:#1769aa;--cyan:#008f95;--orange:#e05a24;--green:#16845b;--purple:#7857a8}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:"Microsoft YaHei UI","Microsoft YaHei",Arial,sans-serif}[hidden]{display:none!important}.page{width:min(1680px,100%);margin:auto;padding:20px 24px 44px}.masthead{display:flex;justify-content:space-between;gap:24px;align-items:flex-end;padding:22px 0 18px;border-bottom:3px solid var(--ink)}.eyebrow{font:700 12px Consolas,monospace;letter-spacing:.16em;color:var(--cyan)}h1{font-size:30px;margin:6px 0 0}.masthead p{margin:0;color:var(--muted)}.scope-switch{display:flex;gap:8px;align-items:center;padding:12px 0 4px}.scope-switch strong{margin-right:4px}.scope-button{appearance:none;border:1px solid #8ca4b7;background:#fff;color:var(--ink);padding:9px 15px;cursor:pointer;font-weight:700}.scope-button.active{background:var(--ink);border-color:var(--ink);color:#fff}.anchor-nav{position:sticky;top:0;z-index:8;display:flex;gap:8px;padding:10px 0;background:rgba(244,247,250,.96);border-bottom:1px solid var(--line)}.anchor-nav a{padding:7px 11px;color:var(--blue);text-decoration:none;font-weight:700}.section{margin-top:28px}.section-head{display:flex;justify-content:space-between;align-items:end;gap:20px;margin-bottom:12px}.section h2{font-size:21px;margin:0}.section-head p{margin:0;color:var(--muted);font-size:13px}.table-wrap{overflow:auto;background:var(--panel);border:1px solid var(--line)}table{width:100%;min-width:1450px;border-collapse:collapse;font:13px Consolas,"Microsoft YaHei UI",monospace}th,td{padding:10px 9px;border-bottom:1px solid #e5edf3;text-align:right;white-space:nowrap}thead th{position:sticky;top:0;background:#eaf1f6;color:#243c50}thead th:first-child,tbody th{text-align:left;position:sticky;left:0;background:#fff;z-index:2}thead th:first-child{z-index:3;background:#eaf1f6}th small{display:block;color:var(--muted);font-weight:400}.avg{color:var(--ink)}.max{color:var(--orange);margin-left:7px}.max:before{content:"/ ";color:#9aa9b5}.role{display:inline-grid;place-items:center;min-width:34px;padding:3px 7px;margin-right:6px;border-radius:3px;color:#fff;font:700 12px Consolas,monospace}.role-p,.role-bg-p{background:var(--blue)}.role-d,.role-bg-d{background:var(--cyan)}.role-ifb,.role-bg-ifb{background:var(--purple)}.compare-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.compare-card{background:#fff;border:1px solid var(--line);padding:15px}.compare-card h3{margin:0;font-size:16px}.compare-card h3 small{color:var(--muted)}.compare-legend{margin:4px 0 12px;color:var(--muted);font-size:11px}.bar-row{display:grid;grid-template-columns:92px minmax(120px,1fr) 112px;gap:9px;align-items:center;margin:8px 0;font:12px Consolas,monospace}.bar-node{overflow:hidden;text-overflow:ellipsis}.role-dot{display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%}.role-dot.role-p{background:var(--blue)}.role-dot.role-d{background:var(--cyan)}.role-dot.role-ifb{background:var(--purple)}.bar-track{height:13px;background:#e7eef3;position:relative}.bar-fill{display:block;height:100%;min-width:1px}.maximum-marker{position:absolute;top:-3px;transform:translateX(-50%);color:var(--orange)}.maximum-marker:after{content:"◆";font-style:normal;font-size:13px}.bar-value{text-align:right;color:#334e62}.detail-controls{background:#eaf1f6;border:1px solid var(--line);padding:12px}.role-tabs,.node-tabs{display:flex;flex-wrap:wrap;gap:8px}.node-tabs{margin-top:9px}.role-tab,.node-tab{appearance:none;border:1px solid #9fb2c1;background:#fff;color:var(--ink);padding:7px 12px;cursor:pointer;font:700 13px "Microsoft YaHei UI",sans-serif}.role-tab.active,.node-tab.active,.scope-button:focus-visible,.role-tab:focus-visible,.node-tab:focus-visible,a:focus-visible{outline:3px solid #f3a45f;outline-offset:2px}.role-tab.active,.node-tab.active{background:var(--ink);border-color:var(--ink);color:#fff}.detail-panel{display:none;margin-top:12px;background:#fff;border:1px solid var(--line);padding:14px}.detail-panel.active{display:block}.detail-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.detail-title>div{display:flex;align-items:center}.detail-title h3{display:inline;margin:0;font-size:18px}.svg-link{display:block;margin:-40px 0 14px auto;width:max-content;color:var(--blue);font-weight:700;text-decoration:none}.detail-panel img{display:block;width:100%;height:auto;border:1px solid #e3ebf1}footer{margin-top:24px;color:var(--muted);font-size:12px}@media(max-width:900px){.page{padding:12px}.masthead{display:block}.masthead p{margin-top:9px}.scope-switch{align-items:stretch;flex-direction:column}.compare-grid{grid-template-columns:1fr}.section-head{display:block}.section-head p{margin-top:5px}.bar-row{grid-template-columns:76px 1fr 92px}.detail-title{align-items:flex-start;gap:10px}.svg-link{margin:0 0 10px}}
+.role-tab.active:not(:focus-visible),.node-tab.active:not(:focus-visible){outline:none}
+</style></head><body><main class="page"><header class="masthead"><div><span class="eyebrow">SUPERNODE RESOURCE REPORT</span><h1>__TITLE__ 监控总览</h1></div><p>__NODE_COUNT__ 个计算节点<br><span class="scope-content" data-scope="shared">__SHARED_SUMMARY__</span><span class="scope-content" data-scope="per-node">__NODE_SUMMARY__</span></p></header><div class="scope-switch" role="group" aria-label="稳态统计口径"><strong>统计口径</strong><button type="button" class="scope-button" data-select-scope="shared">统一稳态区间</button><button type="button" class="scope-button" data-select-scope="per-node">每节点独立区间</button></div><nav class="anchor-nav"><a href="#overview">节点汇总</a><a href="#compare">跨节点比较</a><a href="#details">时间曲线</a></nav>
+<section id="overview" class="section"><div class="section-head"><h2>稳态节点汇总矩阵</h2><p><span class="scope-content" data-scope="shared">所有节点使用同一个稳态区间</span><span class="scope-content" data-scope="per-node">每个节点使用自己检测出的稳态区间</span>；表中为平均值 / 最大值</p></div><div class="table-wrap"><table><thead><tr><th>角色 / 节点</th>__TABLE_HEADER__</tr></thead><tbody>__TABLE_ROWS__</tbody></table></div></section>
 <section id="compare" class="section"><div class="section-head"><h2>跨节点关键指标</h2><p>彩色条为平均值，橙色菱形为最大值</p></div><div class="compare-grid">__COMPARE_CARDS__</div></section>
 <section id="details" class="section"><div class="section-head"><h2>单节点完整时间曲线</h2><p>一次显示一个节点，保持原图文字清晰</p></div><div class="detail-controls"><div class="role-tabs">__ROLE_BUTTONS__</div>__NODE_TABS__</div>__DETAIL_PANELS__</section>
-<footer>完整时间曲线保留脚本全程数据；紫色区域为稳态，路由端口事件仍单独标记。DCU 利用率统一采用最近1秒 HCU active ratio。</footer></main>
-<script>(function(){const roleButtons=[...document.querySelectorAll('.role-tab')],nodeGroups=[...document.querySelectorAll('.node-tabs')],nodeButtons=[...document.querySelectorAll('.node-tab')],panels=[...document.querySelectorAll('.detail-panel')];function showNode(id){nodeButtons.forEach(b=>b.classList.toggle('active',b.dataset.detail===id));panels.forEach(p=>p.classList.toggle('active',p.id===id))}function showRole(role){roleButtons.forEach(b=>b.classList.toggle('active',b.dataset.role===role));nodeGroups.forEach(g=>g.style.display=g.dataset.role===role?'flex':'none');const first=nodeButtons.find(b=>b.closest('.node-tabs').dataset.role===role);if(first)showNode(first.dataset.detail)}roleButtons.forEach(b=>b.addEventListener('click',()=>showRole(b.dataset.role)));nodeButtons.forEach(b=>b.addEventListener('click',()=>showNode(b.dataset.detail)));if(roleButtons[0])showRole(roleButtons[0].dataset.role)})();</script></body></html>'''
+<footer>完整时间曲线保留脚本全程数据；按钮会同时切换汇总数值和紫色稳态区间。路由端口事件单独标记，DCU利用率统一采用最近1秒 HCU active ratio。</footer></main>
+<script>(function(){const scopeButtons=[...document.querySelectorAll('[data-select-scope]')],scopeContents=[...document.querySelectorAll('.scope-content')],roleButtons=[...document.querySelectorAll('.role-tab')],nodeGroups=[...document.querySelectorAll('.node-tabs')],nodeButtons=[...document.querySelectorAll('.node-tab')],panels=[...document.querySelectorAll('.detail-panel')];function showScope(scope){scopeButtons.forEach(b=>b.classList.toggle('active',b.dataset.selectScope===scope));scopeContents.forEach(el=>el.hidden=el.dataset.scope!==scope)}function showNode(id){nodeButtons.forEach(b=>b.classList.toggle('active',b.dataset.detail===id));panels.forEach(p=>p.classList.toggle('active',p.id===id))}function showRole(role){roleButtons.forEach(b=>b.classList.toggle('active',b.dataset.role===role));nodeGroups.forEach(g=>g.style.display=g.dataset.role===role?'flex':'none');const first=nodeButtons.find(b=>b.closest('.node-tabs').dataset.role===role);if(first)showNode(first.dataset.detail)}scopeButtons.forEach(b=>b.addEventListener('click',()=>showScope(b.dataset.selectScope)));roleButtons.forEach(b=>b.addEventListener('click',()=>showRole(b.dataset.role)));nodeButtons.forEach(b=>b.addEventListener('click',()=>showNode(b.dataset.detail)));showScope('shared');if(roleButtons[0])showRole(roleButtons[0].dataset.role)})();</script></body></html>'''
     for key,value in replacements.items():doc=doc.replace(key,value)
     path.write_text(doc,encoding="utf-8")
 
@@ -1513,7 +1559,7 @@ def main():
             if event_seq>tagged[node] and events:route_event=events[-1]["event"]; tagged[node]=event_seq
             timing={"timestamp":iso_time(received),"node_timestamp":iso_time(node_ts),"node_clock_offset_s":round(node_ts-received,6),"elapsed_s":elapsed}
             host_row={**timing,"role":role,"node":node,"route_state":route_state,"route_event":route_event,
-                      "phase":"unclassified",
+                      "phase":"unclassified","shared_phase":"unclassified","node_phase":"unclassified",
                       "cpu_util_pct":sample.get("cpu_util_pct"),"cpu_user_pct":sample.get("cpu_user_pct"),"cpu_system_pct":sample.get("cpu_system_pct"),
                       "cpu_iowait_pct":sample.get("cpu_iowait_pct"),"cpu_temp_avg_c":sample.get("cpu_temp_avg_c"),"cpu_temp_max_c":sample.get("cpu_temp_max_c"),
                       "cpu_freq_avg_mhz":sample.get("cpu_freq_avg_mhz"),"cpu_freq_max_mhz":sample.get("cpu_freq_max_mhz"),
@@ -1523,7 +1569,7 @@ def main():
             hw,dw=writers[node]; host_rows[node].append(host_row); hw.writerow(host_row)
             for card in sample.get("dcus",[]):
                 drow={**timing,"role":role,"node":node,"route_state":route_state,"route_event":route_event,
-                      "phase":"unclassified",
+                      "phase":"unclassified","shared_phase":"unclassified","node_phase":"unclassified",
                       "dcu_index":card.get("index"),"dcu_util_pct":card.get("active_util_pct"),
                       "dcu_util_sample_age_s":round(received-active["received"],3) if active else None,
                       "dcu_mem_used_gib":card.get("mem_used_mib")/1024 if card.get("mem_used_mib") is not None else None,
@@ -1541,32 +1587,48 @@ def main():
                       "--" if sample.get("node_power_w") is None else "%.1fW"%sample["node_power_w"]),flush=True)
                 if card_count!=expected_cards:print("[%s/%s] 警告: 期望 %d 张 DCU，实际采集到 %d 张"%(role,node,expected_cards,card_count),file=sys.stderr,flush=True)
     stop.set(); ended=time.time(); total_elapsed=round(ended-started,3)
-    steady=detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed); mark_phases(host_rows,dcu_rows,steady)
-    stable_host={node:[row for row in rows if row.get("phase")=="steady"] for node,rows in host_rows.items()}
-    stable_dcu={node:[row for row in rows if row.get("phase")=="steady"] for node,rows in dcu_rows.items()}
-    all_summary=[]; all_full_summary=[]; node_infos=[]
+    shared_steady=detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed); shared_steady["scope"]="shared"
+    node_steady=detect_node_steady_states(cfg,roles,dcu_rows,total_elapsed)
+    mark_phases(host_rows,dcu_rows,shared_steady,"phase"); mark_phases(host_rows,dcu_rows,shared_steady,"shared_phase")
+    mark_node_phases(host_rows,dcu_rows,node_steady)
+    shared_host={node:steady_rows(rows,shared_steady) for node,rows in host_rows.items()}
+    shared_dcu={node:steady_rows(rows,shared_steady) for node,rows in dcu_rows.items()}
+    node_host={node:steady_rows(rows,node_steady[node]) for node,rows in host_rows.items()}
+    node_dcu={node:steady_rows(rows,node_steady[node]) for node,rows in dcu_rows.items()}
+    all_shared_summary=[]; all_node_summary=[]; all_full_summary=[]; node_infos=[]
     for node,role in roles.items():
         ndir=outdir/role/node
         write_csv(ndir/"host.csv",HOST_FIELDS,host_rows[node]); write_csv(ndir/"dcu_cards.csv",NODE_DCU_FIELDS,dcu_rows[node])
-        summary=build_node_summary(role,node,stable_host[node],stable_dcu[node]); full_summary=build_node_summary(role,node,host_rows[node],dcu_rows[node])
-        all_summary.extend(summary); all_full_summary.extend(full_summary)
-        write_csv(ndir/"summary.csv",SUMMARY_FIELDS,summary)
+        shared_summary=build_node_summary(role,node,shared_host[node],shared_dcu[node])
+        per_node_summary=build_node_summary(role,node,node_host[node],node_dcu[node])
+        full_summary=build_node_summary(role,node,host_rows[node],dcu_rows[node])
+        all_shared_summary.extend(shared_summary); all_node_summary.extend(per_node_summary); all_full_summary.extend(full_summary)
+        # summary.csv 与 visualization.svg 继续代表统一口径，兼容已有分析流程。
+        write_csv(ndir/"summary.csv",SUMMARY_FIELDS,shared_summary)
+        write_csv(ndir/"shared_summary.csv",SUMMARY_FIELDS,shared_summary)
+        write_csv(ndir/"per_node_summary.csv",SUMMARY_FIELDS,per_node_summary)
         write_csv(ndir/"full_summary.csv",SUMMARY_FIELDS,full_summary)
-        make_node_svg(ndir/"visualization.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,steady)
-        node_infos.append((role,node,"%s/%s/visualization.svg"%(role,node)))
-    write_csv(outdir/"summary.csv",SUMMARY_FIELDS,all_summary); write_csv(outdir/"full_summary.csv",SUMMARY_FIELDS,all_full_summary)
-    make_dashboard(outdir/"dashboard.html",model,node_infos,stable_host,stable_dcu,steady)
-    (outdir/"steady_state.json").write_text(json.dumps(steady,ensure_ascii=False,indent=2),encoding="utf-8")
+        make_node_svg(ndir/"visualization.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,shared_steady)
+        make_node_svg(ndir/"visualization_per_node.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,node_steady[node])
+        node_infos.append((role,node,"%s/%s/visualization.svg"%(role,node),"%s/%s/visualization_per_node.svg"%(role,node)))
+    write_csv(outdir/"summary.csv",SUMMARY_FIELDS,all_shared_summary)
+    write_csv(outdir/"shared_summary.csv",SUMMARY_FIELDS,all_shared_summary)
+    write_csv(outdir/"per_node_summary.csv",SUMMARY_FIELDS,all_node_summary)
+    write_csv(outdir/"full_summary.csv",SUMMARY_FIELDS,all_full_summary)
+    make_dashboard(outdir/"dashboard.html",model,node_infos,shared_host,shared_dcu,node_host,node_dcu,shared_steady,node_steady)
+    steady_report={**shared_steady,"shared":shared_steady,"per_node":node_steady}
+    (outdir/"steady_state.json").write_text(json.dumps(steady_report,ensure_ascii=False,indent=2),encoding="utf-8")
     metadata={"model_name":model,"deployment_mode":mode,"started_at":iso_time(started),"ended_at":iso_time(ended),"duration_s":total_elapsed,
-              "nodes":roles,"route_events":events,"steady_state":steady}
+              "nodes":roles,"route_events":events,"steady_state":steady_report}
     (outdir/"run_metadata.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
-    if steady.get("status")=="disabled_full_run":
-        steady_text="判断已禁用，汇总使用完整运行区间"
-    elif steady.get("start_elapsed_s") is not None:
-        steady_text="%.1fs–%.1fs，持续%.1fs，参考组%s，结束%s"%(steady["start_elapsed_s"],steady["end_elapsed_s"],steady["duration_s"],steady.get("reference_group"),"已确认" if steady.get("end_confirmed") else "未确认")
+    if shared_steady.get("status")=="disabled_full_run":
+        steady_text="判断已禁用，两种口径均使用完整运行区间"
+    elif shared_steady.get("start_elapsed_s") is not None:
+        steady_text="%.1fs–%.1fs，持续%.1fs，参考组%s，结束%s"%(shared_steady["start_elapsed_s"],shared_steady["end_elapsed_s"],shared_steady["duration_s"],shared_steady.get("reference_group"),"已确认" if shared_steady.get("end_confirmed") else "未确认")
     else:steady_text="未检测到（稳态汇总为空，请查看 full_summary.csv）"
-    print("\n监控结束，共 %.1fs。\n稳态区间: %s\n稳态汇总: %s\n全程汇总: %s\n可视化入口: %s"%(
-          total_elapsed,steady_text,outdir/"summary.csv",outdir/"full_summary.csv",outdir/"dashboard.html"),flush=True)
+    node_detected=sum(1 for result in node_steady.values() if result.get("start_elapsed_s") is not None)
+    print("\n监控结束，共 %.1fs。\n统一稳态区间: %s\n每节点独立稳态: 已检测 %d/%d 个节点\n统一口径汇总: %s\n独立口径汇总: %s\n全程汇总: %s\n可视化入口: %s"%(
+          total_elapsed,steady_text,node_detected,len(node_steady),outdir/"shared_summary.csv",outdir/"per_node_summary.csv",outdir/"full_summary.csv",outdir/"dashboard.html"),flush=True)
 
 
 if __name__=="__main__": main()
