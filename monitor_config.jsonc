@@ -119,7 +119,7 @@
   //             不能只下载 HTML，否则同目录中的 SVG 无法加载。
   //
   // 查看方式2：在 Windows 本地终端建立 SSH 隧道并保持终端运行：
-  // ssh -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && python3 -m http.server 18080 --bind 127.0.0.1"
-  // 虚拟示例：ssh -p 2222 -L 18080:127.0.0.1:18080 root@192.0.2.10 "cd /root/dcu_monitor/results && python3 -m http.server 18080 --bind 127.0.0.1"
-  // 然后打开 http://127.0.0.1:18080/；按 Ctrl+C 停止服务和隧道。
+  // ssh -tt -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && exec python3 -m http.server 18080 --bind 127.0.0.1"
+  // 将四个大括号占位符替换为当前环境的实际值，然后打开 http://127.0.0.1:18080/。
+  // -tt + exec 会把 Ctrl+C 传给远端 HTTP 服务，并同时结束 SSH 隧道。
 }

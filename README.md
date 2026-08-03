@@ -165,13 +165,7 @@ IFB 模式会生成 `IFB/` 目录。
 ssh -tt -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && exec python3 -m http.server 18080 --bind 127.0.0.1"
 ```
 
-例如项目路径是 `/root/dcu_monitor`，则 `{PROJECT_PATH}` 替换为该路径。下面是一条完整示例命令：假设跳板机 SSH 地址为 `192.0.2.10`、用户为 `root`、SSH 端口为 `2222`。
-
-```powershell
-ssh -tt -p 2222 -L 18080:127.0.0.1:18080 root@192.0.2.10 "cd /root/dcu_monitor/results && exec python3 -m http.server 18080 --bind 127.0.0.1"
-```
-
-`192.0.2.10` 和 `2222` 是文档示例，请替换成真实跳板机 IP 和 SSH 端口。保持终端运行，然后浏览器访问：
+将 `{SSH_PORT}`、`{USER}`、`{JUMP_HOST}`、`{PROJECT_PATH}` 全部替换为当前环境的实际值。保持终端运行，然后浏览器访问：
 
 ```text
 http://127.0.0.1:18080/
@@ -184,25 +178,25 @@ http://127.0.0.1:18080/
 如果启动时出现 `OSError: [Errno 98] Address already in use`，说明跳板机上的 `127.0.0.1:18080` 已经有旧的 HTTP 服务。先查看占用进程：
 
 ```powershell
-ssh -p 5173 root@10.2.208.225 "ss -ltnp | grep ':18080 '"
+ssh -p {SSH_PORT} {USER}@{JUMP_HOST} "ss -ltnp | grep ':18080 '"
 ```
 
 输出中会包含类似 `pid=12345` 的进程号。确认它是旧的 `python3 -m http.server 18080` 后，正常结束该 PID：
 
 ```powershell
-ssh -p 5173 root@10.2.208.225 "kill 12345"
+ssh -p {SSH_PORT} {USER}@{JUMP_HOST} "kill {PID}"
 ```
 
 再检查一次，命令没有输出就表示远端端口已释放：
 
 ```powershell
-ssh -p 5173 root@10.2.208.225 "ss -ltnp | grep ':18080 ' || true"
+ssh -p {SSH_PORT} {USER}@{JUMP_HOST} "ss -ltnp | grep ':18080 ' || true"
 ```
 
 随后重新启动结果服务并建立隧道：
 
 ```powershell
-ssh -tt -p 5173 -L 18080:127.0.0.1:18080 root@10.2.208.225 "cd /root/dcu_monitor/results && exec python3 -m http.server 18080 --bind 127.0.0.1"
+ssh -tt -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && exec python3 -m http.server 18080 --bind 127.0.0.1"
 ```
 
 保持 PowerShell 窗口运行，浏览器打开 `http://127.0.0.1:18080/`。本次使用完成后在该 PowerShell 窗口按 `Ctrl+C`，然后用上面的 `ss -ltnp` 命令确认 18080 已释放。若当前连接是用旧版无 `-tt` 命令建立的，需先按 PID 执行一次 `kill`；之后使用这里的新命令即可让 `Ctrl+C` 正常传递到远端。
@@ -210,7 +204,7 @@ ssh -tt -p 5173 -L 18080:127.0.0.1:18080 root@10.2.208.225 "cd /root/dcu_monitor
 如果确认远端已有的 18080 服务正是需要查看的结果目录，可以不重启服务，只重新建立隧道：
 
 ```powershell
-ssh -p 5173 -N -L 18080:127.0.0.1:18080 root@10.2.208.225
+ssh -p {SSH_PORT} -N -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST}
 ```
 
 这种 `-N` 方式没有启动远端 HTTP 服务，所以 `Ctrl+C` 只关闭本地 SSH 隧道，远端已有服务会继续运行；需要关闭远端服务时仍要查出 PID 后执行 `kill PID`。
