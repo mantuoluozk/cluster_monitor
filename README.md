@@ -15,6 +15,16 @@
 
 每个计算节点可以单独查看，P、D、IFB 节点也会分类保存。
 
+## 效果预览
+
+全节点汇总与跨节点关键指标对比：
+
+![全节点监控汇总](docs/images/dashboard-overview.png)
+
+按 P、D、IFB 和节点切换的完整时间曲线：
+
+![单节点完整时间曲线](docs/images/dashboard-node-detail.png)
+
 ## 环境要求
 
 跳板机需要：
@@ -135,7 +145,13 @@ IFB 模式会生成 `IFB/` 目录。
 ssh -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && python3 -m http.server 18080 --bind 127.0.0.1"
 ```
 
-例如项目路径是 `/root/dcu_monitor`，则 `{PROJECT_PATH}` 替换为该路径。保持终端运行，然后浏览器访问：
+例如项目路径是 `/root/dcu_monitor`，则 `{PROJECT_PATH}` 替换为该路径。下面是一条完整示例命令：假设跳板机 SSH 地址为 `192.0.2.10`、用户为 `root`、SSH 端口为 `2222`。
+
+```powershell
+ssh -p 2222 -L 18080:127.0.0.1:18080 root@192.0.2.10 "cd /root/dcu_monitor/results && python3 -m http.server 18080 --bind 127.0.0.1"
+```
+
+`192.0.2.10` 和 `2222` 是文档示例，请替换成真实跳板机 IP 和 SSH 端口。保持终端运行，然后浏览器访问：
 
 ```text
 http://127.0.0.1:18080/
@@ -253,4 +269,3 @@ hy-smi --showtemp --json
 跳板机使用 Python `socket.create_connection()` 进行 TCP 建连探测。建连成功仅表示端口可以访问，不代表一次推理已经完成。
 
 </details>
-

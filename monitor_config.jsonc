@@ -77,5 +77,6 @@
   //
   // 查看方式 2：不下载结果。在 Windows 本地终端运行下面的 SSH 隧道命令，并保持终端运行：
   // ssh -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && python3 -m http.server 18080 --bind 127.0.0.1"
+  // 虚拟示例：ssh -p 2222 -L 18080:127.0.0.1:18080 root@192.0.2.10 "cd /root/dcu_monitor/results && python3 -m http.server 18080 --bind 127.0.0.1"
   // 然后浏览器打开 http://127.0.0.1:18080/；按 Ctrl+C 可停止结果服务和隧道。
 }
