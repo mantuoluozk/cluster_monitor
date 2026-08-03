@@ -39,11 +39,24 @@
 
   // 较慢或变化较慢的指标使用独立刷新周期；中间样本复用最近一次成功值。
   "dcu_memory_interval_s": 10,       // 显存容量与占用量刷新周期
-  "dcu_utilization_interval_s": 10,  // 最近1秒 active ratio 命令约耗时4秒，在独立SSH中运行，不阻塞基础采样
+  "dcu_utilization_interval_s": 5,   // 最近1秒 active ratio 命令约耗时4秒，5秒已接近合理下限
   "dcu_temperature_interval_s": 5,  // 四类 DCU 温度刷新周期
   "node_power_interval_s": 5,
   "cpu_power_interval_s": 5,
   "cpu_temperature_interval_s": 5,
+
+  // 稳态在采集结束后判断；原始CSV始终保留脚本全程数据，summary.csv只统计稳态区间。
+  // PD模式的 auto 默认参考D节点，IFB模式默认参考IFB节点。
+  "steady_state": {
+    "enabled": true,
+    "reference_group": "auto",
+    "window_fresh_samples": 6,       // 只数 showhcuutil 的真实新值；5秒周期下约覆盖25秒
+    "confirm_windows": 2,
+    "active_threshold_pct": 5,
+    "max_half_mean_change_pct": 10,
+    "idle_threshold_pct": 2,
+    "idle_confirm_samples": 2
+  },
 
   // 计算节点采集命令。
   // 主命令主要读取 Average Graphics Package Power 等卡信息；其中瞬时 HCU use 不写入结果。

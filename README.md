@@ -2,7 +2,7 @@
 
 面向海光 DCU 超节点推理测试的轻量监控脚本。脚本运行在跳板机，通过 SSH 并行采集多个计算节点的数据，支持 **PD 分离**和 **IFB** 两种部署方式。
 
-它会记录完整测试周期，并在结束后生成 CSV、汇总表和单页 HTML 仪表盘。
+它会记录完整测试周期，在结束后根据 DCU 利用率识别稳态区间，并生成 CSV、稳态汇总表和单页 HTML 仪表盘。
 
 ## 能采集什么
 
@@ -24,6 +24,8 @@
 按 P、D、IFB 和节点切换的完整时间曲线：
 
 ![单节点完整时间曲线](docs/images/dashboard-node-detail.png)
+
+> 截图用于展示页面布局；当前版本的汇总表和图例统一按自动识别出的稳态区间计算。
 
 ## 环境要求
 
@@ -108,7 +110,9 @@ python3 cluster_monitor.py --model DeepSeek-V3 --duration 600
 ```text
 results/DeepSeek-V3_run_YYYYMMDD_HHMMSS/
 ├── dashboard.html              # 单页可视化入口
-├── summary.csv                 # 全部节点和DCU汇总
+├── summary.csv                 # 仅统计稳态区间
+├── full_summary.csv            # 完整生命周期汇总
+├── steady_state.json           # 稳态判断结果与真实利用率样本
 ├── route_events.csv            # 端口状态事件
 ├── effective_config.json       # 本次实际配置
 ├── run_metadata.json
@@ -116,7 +120,8 @@ results/DeepSeek-V3_run_YYYYMMDD_HHMMSS/
 │   └── p1c0/
 │       ├── host.csv            # CPU、内存、整机数据
 │       ├── dcu_cards.csv       # 四张DCU逐卡数据
-│       ├── summary.csv
+│       ├── summary.csv         # 该节点稳态汇总
+│       ├── full_summary.csv    # 该节点全程汇总
 │       └── visualization.svg
 └── D/...
 ```
@@ -125,7 +130,7 @@ IFB 模式会生成 `IFB/` 目录。
 
 仪表盘分为三部分：
 
-1. 全节点平均值/最大值汇总表
+1. 全节点稳态平均值/最大值汇总表
 2. 跨节点关键指标对比
 3. 可切换节点的完整时间曲线
 
@@ -159,14 +164,22 @@ http://127.0.0.1:18080/
 
 按 `Ctrl+C` 即可停止结果服务和 SSH 隧道。服务只绑定服务器的 `127.0.0.1`，不会直接暴露结果目录。
 
-## 统计口径
+## 稳态判断与统计口径
 
-- 平均值和最大值基于本次运行期间的全部有效样本。
-- 每个节点从第一条成功样本统计到结束前最后一条样本。
+- 原始 `host.csv`、`dcu_cards.csv` 始终保留脚本开始到结束的全部数据。
+- PD模式默认使用D节点，IFB模式默认使用IFB节点作为稳态判断参考。
+- 判断只使用 `hy-smi --showhcuutil` 真正刷新的样本，不把中间复用的缓存值重复计数。
+- 默认最近6个真实样本组成窗口，比较前后半段均值；连续2次变化不超过10%后确认稳态。
+- 确认后向前回溯到第一个稳定样本，因此统计起点不是确认时刻。
+- 连续2个真实样本低于2%后确认结束，再回溯到下降前最后一个稳定样本。
+- `summary.csv` 和 HTML 汇总只使用稳态区间；`full_summary.csv` 保留完整生命周期统计。
+- CSV 的 `phase` 会标记 `before_steady`、`steady`、`after_steady` 或 `not_detected`。
 - 缺失值不会按 0 参与计算。
 - 路由端口事件只做标记，不裁剪统计区间。
 - DCU 利用率只采用 `hy-smi --showhcuutil` 的最近1秒 HCU active ratio。
-- 节点 DCU 总功耗先在每个时刻汇总全部卡，再计算全程平均值和最大值。
+- 节点 DCU 总功耗先在每个时刻汇总全部卡，再按稳态区间或完整生命周期分别计算平均值和最大值。
+
+如果停止时模型仍在运行，稳态结束会标记为“未确认”，统计到脚本停止；如果没有检测到稳态，稳态汇总保持为空，不会偷偷用全程数据代替。
 
 ## 常用配置
 
@@ -181,8 +194,11 @@ http://127.0.0.1:18080/
 | `cpu_power_interval_s` | CPU 功耗刷新周期 |
 | `node_power_interval_s` | 整机功耗刷新周期 |
 | `ssh_options` | 跳板机连接计算节点的 SSH 参数 |
+| `steady_state.window_fresh_samples` | 稳态窗口包含的真实利用率样本数 |
+| `steady_state.confirm_windows` | 连续满足多少次后确认稳态 |
+| `steady_state.idle_confirm_samples` | 连续多少个空闲样本后确认结束 |
 
-较慢指标在独立周期刷新，中间样本复用最近一次成功值。`hy-smi --showhcuutil` 在部分环境中耗时约4秒，因此使用独立 SSH 通道，不阻塞基础采样。
+较慢指标在独立周期刷新，中间样本复用最近一次成功值。`hy-smi --showhcuutil` 在部分环境中耗时约4秒，因此默认每5秒在独立 SSH 通道中运行，不阻塞基础采样。
 
 ## 常见问题
 
