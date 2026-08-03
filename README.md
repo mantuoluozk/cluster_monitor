@@ -166,6 +166,7 @@ http://127.0.0.1:18080/
 
 ## 稳态判断与统计口径
 
+- 一键开关位于 `steady_state.enabled`：设为 `true` 时启用稳态判断；设为 `false` 时关闭判断，`summary.csv` 和 HTML 自动改为统计脚本全程。只需修改这一项，其他稳态参数可以保留不动。
 - 原始 `host.csv`、`dcu_cards.csv` 始终保留脚本开始到结束的全部数据。
 - PD模式默认使用D节点，IFB模式默认使用IFB节点作为稳态判断参考。
 - 判断只使用 `hy-smi --showhcuutil` 真正刷新的样本，不把中间复用的缓存值重复计数。
@@ -194,6 +195,7 @@ http://127.0.0.1:18080/
 | `cpu_power_interval_s` | CPU 功耗刷新周期 |
 | `node_power_interval_s` | 整机功耗刷新周期 |
 | `ssh_options` | 跳板机连接计算节点的 SSH 参数 |
+| `steady_state.enabled` | 稳态判断总开关：`true` 开启，`false` 关闭并使用全程统计 |
 | `steady_state.window_fresh_samples` | 稳态窗口包含的真实利用率样本数 |
 | `steady_state.confirm_windows` | 连续满足多少次后确认稳态 |
 | `steady_state.idle_confirm_samples` | 连续多少个空闲样本后确认结束 |
