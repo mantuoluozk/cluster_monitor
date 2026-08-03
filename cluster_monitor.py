@@ -1492,6 +1492,41 @@ def resolve_deployment_groups(cfg):
     return mode,active,roles
 
 
+def node_health_text(roles,node_health,cfg,now,started):
+    """汇总监控采集链路健康度；不依据模型负载或利用率高低判断。"""
+    expected=int(cfg.get("expected_dcu_cards_per_node",4))
+    sample_timeout=max(10.0,float(cfg.get("sample_interval_s",2))*4)
+    util_interval=float(cfg.get("dcu_utilization_interval_s",5))
+    util_timeout=max(15.0,util_interval*3)
+    util_grace=max(10.0,util_interval*2+2)
+    reasons={}; healthy_by_role=defaultdict(int); total_by_role=defaultdict(int)
+    for node,role in roles.items():
+        total_by_role[role]+=1; state=node_health.get(node,{}) ; node_reasons=[]
+        received=state.get("last_received")
+        if received is None:node_reasons.append("未收到首包")
+        else:
+            age=max(0.0,now-received)
+            if age>sample_timeout:node_reasons.append("节点采样超时%.0fs"%age)
+            card_count=state.get("dcu_count")
+            if card_count is not None and card_count!=expected:node_reasons.append("DCU=%s/%s"%(card_count,expected))
+            if state.get("last_error"):node_reasons.append("采集报错")
+        if cfg.get("dcu_utilization_command") and now-started>=util_grace:
+            util_received=state.get("util_received")
+            if util_received is None:node_reasons.append("DCU利用率未就绪")
+            elif now-util_received>util_timeout:node_reasons.append("DCU利用率超时%.0fs"%(now-util_received))
+            if state.get("util_error"):node_reasons.append("DCU利用率报错")
+        if node_reasons:reasons[node]="/".join(dict.fromkeys(node_reasons))
+        else:healthy_by_role[role]+=1
+    role_order=[]
+    for role in roles.values():
+        if role not in role_order:role_order.append(role)
+    groups=", ".join("%s %d/%d正常"%(role,healthy_by_role[role],total_by_role[role]) for role in role_order)
+    healthy=sum(healthy_by_role.values()); total=len(roles)
+    if healthy==total:return "节点采集 %d/%d正常（全部正常；%s）"%(healthy,total,groups),True
+    details=", ".join("%s(%s)"%(node,reasons[node]) for node in roles if node in reasons)
+    return "节点采集 %d/%d正常（%s） | 异常: %s"%(healthy,total,groups,details),False
+
+
 def main():
     ap=argparse.ArgumentParser(description="PD/IFB 服务全生命周期资源监控")
     ap.add_argument("--config",default="monitor_config.jsonc")
@@ -1507,6 +1542,7 @@ def main():
     cfg["model_name"]=model; (outdir/"effective_config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=2),encoding="utf-8")
     q=queue.Queue(); stop=threading.Event(); started=time.time(); threads=[]; node_threads=[]; seen=set(); route_state="unknown"
     events=[]; event_seq=0; tagged={node:0 for node in roles}; host_rows={node:[] for node in roles}; dcu_rows={node:[] for node in roles}
+    node_health={node:{"last_received":None,"dcu_count":None,"last_error":"","util_received":None,"util_error":""} for node in roles}
     latest_active={}
     signal.signal(signal.SIGINT,lambda *_:stop.set())
     print("模型名称: %s\n输出目录: %s\n部署模式: %s\n节点分组: %s"%(model,outdir,mode,"; ".join("%s=[%s]"%(r,", ".join(ns)) for r,ns in active_groups.items())),flush=True)
@@ -1529,32 +1565,42 @@ def main():
                 util_thread=threading.Thread(target=spawn_dcu_util,args=(node,cfg,q,stop),daemon=True); util_thread.start(); threads.append(util_thread)
         if probe.get("enabled",False):
             thread=threading.Thread(target=probe_route,args=(cfg,q,stop,started),daemon=True); thread.start(); threads.append(thread)
-        last_status=started
+        last_status=started; first_packet_check_printed=False
         while not stop.is_set():
             if duration>0 and time.time()-started>=duration:stop.set(); break
+            now=time.time()
+            if now-last_status>=10:
+                health_text,_=node_health_text(roles,node_health,cfg,now,started)
+                print("[状态] 已运行 %.0fs | %s | 路由端口 %s"%(now-started,health_text,route_state),flush=True)
+                last_status=now
             try:node,sample,err=q.get(timeout=.5)
             except queue.Empty:
-                if time.time()-last_status>=10:
-                    print("[状态] 已运行 %.0fs | 已收节点 %d/%d | 路由端口 %s"%(time.time()-started,len(seen),len(roles),route_state),flush=True); last_status=time.time()
                 if node_threads and not any(t.is_alive() for t in node_threads):break
                 continue
             if node.startswith("__dcuutil__:"):
                 target=node.split(":",1)[1]
-                if sample is None:print("[%s/DCU最近1秒利用率] %s"%(target,err),file=sys.stderr,flush=True)
-                else:latest_active[target]={"received":time.time(),"cards":sample.get("cards",[])}
+                if sample is None:
+                    node_health[target]["util_error"]=str(err or "未知错误")
+                    print("[%s/DCU最近1秒利用率] %s"%(target,err),file=sys.stderr,flush=True)
+                else:
+                    util_received=time.time(); latest_active[target]={"received":util_received,"cards":sample.get("cards",[])}
+                    node_health[target]["util_received"]=util_received; node_health[target]["util_error"]=""
                 continue
             if node=="__route__":
                 if sample is None:print("[路由端口] "+str(err),file=sys.stderr,flush=True); continue
                 route_state=sample["state"]; events.append(sample); event_seq+=1; event_writer.writerow(sample); event_stream.flush()
                 print("[路由端口] %s %s:%s，观测=%s，确认=%s"%(sample["state"],sample["host"],sample["port"],sample["timestamp"],sample["confirmed_timestamp"]),flush=True)
                 continue
-            if sample is None:print("[%s] %s"%(node,err),file=sys.stderr,flush=True); continue
+            if sample is None:
+                if node in node_health:node_health[node]["last_error"]=str(err or "未知错误")
+                print("[%s] %s"%(node,err),file=sys.stderr,flush=True); continue
             active=latest_active.get(node)
             if active:
                 supplemental=[]
                 for card in active["cards"]:supplemental.append({"index":card.get("index"),"active_util_pct":card.get("util_pct")})
                 sample["dcus"]=merge_dcu_cards(sample.get("dcus",[]),supplemental)
             role=roles[node]; seen.add(node); received=time.time(); node_ts=sample.get("ts",received); elapsed=round(received-started,3)
+            node_health[node].update({"last_received":received,"dcu_count":len(sample.get("dcus",[])),"last_error":str(sample.get("error","") or "")})
             route_event=""
             if event_seq>tagged[node] and events:route_event=events[-1]["event"]; tagged[node]=event_seq
             timing={"timestamp":iso_time(received),"node_timestamp":iso_time(node_ts),"node_clock_offset_s":round(node_ts-received,6),"elapsed_s":elapsed}
@@ -1586,6 +1632,14 @@ def main():
                       "--" if sample.get("cpu_power_w") is None else "%.1fW"%sample["cpu_power_w"],
                       "--" if sample.get("node_power_w") is None else "%.1fW"%sample["node_power_w"]),flush=True)
                 if card_count!=expected_cards:print("[%s/%s] 警告: 期望 %d 张 DCU，实际采集到 %d 张"%(role,node,expected_cards,card_count),file=sys.stderr,flush=True)
+            if not first_packet_check_printed and len(seen)==len(roles):
+                cards_by_role=[]
+                for group,group_nodes in active_groups.items():
+                    cards_by_role.append("%s: %s"%(group,", ".join("%s(%s卡)"%(name,node_health[name].get("dcu_count","--")) for name in group_nodes)))
+                all_base_ok=all(node_health[name].get("dcu_count")==int(cfg.get("expected_dcu_cards_per_node",4)) and not node_health[name].get("last_error") for name in roles)
+                label="所有节点首包正常" if all_base_ok else "所有节点首包已收到，但存在采集异常"
+                print("[节点检查] %s | %s"%(label,"; ".join(cards_by_role)),flush=True)
+                first_packet_check_printed=True
     stop.set(); ended=time.time(); total_elapsed=round(ended-started,3)
     shared_steady=detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed); shared_steady["scope"]="shared"
     node_steady=detect_node_steady_states(cfg,roles,dcu_rows,total_elapsed)
