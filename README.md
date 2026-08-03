@@ -135,6 +135,7 @@ results/DeepSeek-V3_run_YYYYMMDD_HHMMSS/
 │       ├── shared_summary.csv
 │       ├── per_node_summary.csv
 │       ├── full_summary.csv    # 该节点全程汇总
+│       ├── visualization_full.svg # 无稳态判断的全程曲线
 │       ├── visualization.svg   # 统一稳态区间曲线
 │       └── visualization_per_node.svg
 └── D/...
@@ -144,9 +145,9 @@ IFB 模式会生成 `IFB/` 目录。
 
 仪表盘分为三部分：
 
-1. 可在“统一稳态区间”和“每节点独立区间”之间切换的平均值/最大值汇总表
+1. 可在“无稳态判断”“统一稳态区间”和“每节点独立区间”之间切换的平均值/最大值汇总表，默认使用全程数据
 2. 跨节点关键指标对比
-3. 可切换节点的完整时间曲线
+3. 可切换节点及三种统计口径的完整时间曲线
 
 ## 查看结果
 
@@ -161,13 +162,13 @@ IFB 模式会生成 `IFB/` 目录。
 在本地终端执行下面的命令，并替换其中的大括号参数：
 
 ```powershell
-ssh -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && python3 -m http.server 18080 --bind 127.0.0.1"
+ssh -tt -p {SSH_PORT} -L 18080:127.0.0.1:18080 {USER}@{JUMP_HOST} "cd {PROJECT_PATH}/results && exec python3 -m http.server 18080 --bind 127.0.0.1"
 ```
 
 例如项目路径是 `/root/dcu_monitor`，则 `{PROJECT_PATH}` 替换为该路径。下面是一条完整示例命令：假设跳板机 SSH 地址为 `192.0.2.10`、用户为 `root`、SSH 端口为 `2222`。
 
 ```powershell
-ssh -p 2222 -L 18080:127.0.0.1:18080 root@192.0.2.10 "cd /root/dcu_monitor/results && python3 -m http.server 18080 --bind 127.0.0.1"
+ssh -tt -p 2222 -L 18080:127.0.0.1:18080 root@192.0.2.10 "cd /root/dcu_monitor/results && exec python3 -m http.server 18080 --bind 127.0.0.1"
 ```
 
 `192.0.2.10` 和 `2222` 是文档示例，请替换成真实跳板机 IP 和 SSH 端口。保持终端运行，然后浏览器访问：
@@ -176,11 +177,47 @@ ssh -p 2222 -L 18080:127.0.0.1:18080 root@192.0.2.10 "cd /root/dcu_monitor/resul
 http://127.0.0.1:18080/
 ```
 
-按 `Ctrl+C` 即可停止结果服务和 SSH 隧道。服务只绑定服务器的 `127.0.0.1`，不会直接暴露结果目录。
+命令中的 `-tt` 会强制分配远端终端，`exec` 会让 Python 替换远端 shell。这样在 PowerShell 中按 `Ctrl+C` 时，中断信号会传给远端 HTTP 服务，同时关闭 SSH 隧道。服务只绑定服务器的 `127.0.0.1`，不会直接暴露结果目录。
+
+### 关闭遗留的结果服务并重新连接
+
+如果启动时出现 `OSError: [Errno 98] Address already in use`，说明跳板机上的 `127.0.0.1:18080` 已经有旧的 HTTP 服务。先查看占用进程：
+
+```powershell
+ssh -p 5173 root@10.2.208.225 "ss -ltnp | grep ':18080 '"
+```
+
+输出中会包含类似 `pid=12345` 的进程号。确认它是旧的 `python3 -m http.server 18080` 后，正常结束该 PID：
+
+```powershell
+ssh -p 5173 root@10.2.208.225 "kill 12345"
+```
+
+再检查一次，命令没有输出就表示远端端口已释放：
+
+```powershell
+ssh -p 5173 root@10.2.208.225 "ss -ltnp | grep ':18080 ' || true"
+```
+
+随后重新启动结果服务并建立隧道：
+
+```powershell
+ssh -tt -p 5173 -L 18080:127.0.0.1:18080 root@10.2.208.225 "cd /root/dcu_monitor/results && exec python3 -m http.server 18080 --bind 127.0.0.1"
+```
+
+保持 PowerShell 窗口运行，浏览器打开 `http://127.0.0.1:18080/`。本次使用完成后在该 PowerShell 窗口按 `Ctrl+C`，然后用上面的 `ss -ltnp` 命令确认 18080 已释放。若当前连接是用旧版无 `-tt` 命令建立的，需先按 PID 执行一次 `kill`；之后使用这里的新命令即可让 `Ctrl+C` 正常传递到远端。
+
+如果确认远端已有的 18080 服务正是需要查看的结果目录，可以不重启服务，只重新建立隧道：
+
+```powershell
+ssh -p 5173 -N -L 18080:127.0.0.1:18080 root@10.2.208.225
+```
+
+这种 `-N` 方式没有启动远端 HTTP 服务，所以 `Ctrl+C` 只关闭本地 SSH 隧道，远端已有服务会继续运行；需要关闭远端服务时仍要查出 PID 后执行 `kill PID`。
 
 ## 稳态判断与统计口径
 
-- 一键开关位于 `steady_state.enabled`：设为 `true` 时同时计算统一稳态和每节点独立稳态；设为 `false` 时关闭判断，两种口径都使用脚本全程。只需修改这一项，其他稳态参数可以保留不动。
+- 程序始终计算统一稳态和每节点独立稳态，不再提供总开关；`steady_state` 中只保留检测算法参数。未检测到稳态时对应稳态页面为空，全程页面不受影响。
 - 原始 `host.csv`、`dcu_cards.csv` 始终保留脚本开始到结束的全部数据。
 - 统一口径：PD模式默认使用全部D节点，IFB模式默认使用全部IFB节点形成一条参考曲线，并把同一区间用于所有节点。
 - 独立口径：每个节点使用自己的四卡平均DCU利用率单独判断，因此各节点的开始和结束时间可以不同。
@@ -188,7 +225,8 @@ http://127.0.0.1:18080/
 - 默认最近6个真实样本组成窗口，比较前后半段均值；连续2次变化不超过10%后确认稳态。
 - 确认后向前回溯到第一个稳定样本，因此统计起点不是确认时刻。
 - 连续2个真实样本低于2%后确认结束，再回溯到下降前最后一个稳定样本。
-- HTML顶部按钮会同时切换汇总表、跨节点比较和曲线中的紫色稳态区域，不需要修改JSONC或重新运行模型。
+- HTML顶部提供“无稳态判断”“统一稳态区间”“每节点独立区间”三个按钮，默认选择“无稳态判断”。按钮会同时切换汇总表、跨节点比较和时间曲线，不需要修改JSONC或重新运行模型。
+- “无稳态判断”直接使用脚本从启动到结束的全部有效样本；即使没有检测到稳态，默认汇总也不会为空。
 - `summary.csv` 与 `shared_summary.csv` 使用统一口径；`per_node_summary.csv` 使用独立口径；`full_summary.csv` 保留完整生命周期统计。
 - 原始CSV的 `phase`/`shared_phase` 标记统一口径，`node_phase` 标记该节点的独立口径，取值包括 `before_steady`、`steady`、`after_steady` 或 `not_detected`。
 - 缺失值不会按 0 参与计算。
@@ -196,7 +234,7 @@ http://127.0.0.1:18080/
 - DCU 利用率只采用 `hy-smi --showhcuutil` 的最近1秒 HCU active ratio。
 - 节点 DCU 总功耗先在每个时刻汇总全部卡，再按稳态区间或完整生命周期分别计算平均值和最大值。
 
-如果停止时模型仍在运行，稳态结束会标记为“未确认”，统计到脚本停止；如果没有检测到稳态，稳态汇总保持为空，不会偷偷用全程数据代替。
+如果停止时模型仍在运行，稳态结束会标记为“未确认”，统计到脚本停止；如果没有检测到稳态，统一/独立稳态汇总仍保持为空，但默认的“无稳态判断”页面会正常展示全程统计。
 
 ## 常用配置
 
@@ -211,7 +249,6 @@ http://127.0.0.1:18080/
 | `cpu_power_interval_s` | CPU 功耗刷新周期 |
 | `node_power_interval_s` | 整机功耗刷新周期 |
 | `ssh_options` | 跳板机连接计算节点的 SSH 参数 |
-| `steady_state.enabled` | 稳态判断总开关：`true` 同时计算两种口径，`false` 两种口径都使用全程统计 |
 | `steady_state.window_fresh_samples` | 稳态窗口包含的真实利用率样本数 |
 | `steady_state.confirm_windows` | 连续满足多少次后确认稳态 |
 | `steady_state.idle_confirm_samples` | 连续多少个空闲样本后确认结束 |
