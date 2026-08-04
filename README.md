@@ -144,7 +144,7 @@ HTML 顶部提供四种口径：
 1. 选择“统一应用所有节点”或“每节点分别设置”。
 2. 参考控制区中的 DCU 利用率曲线，拖动同一条轨道上的开始、结束手柄。
 3. 也可以在组合输入框中直接填写相对脚本启动时间的秒数。
-4. 点击“应用并查看”，汇总矩阵、跨节点比较和时间曲线会同步更新。
+4. 点击“应用并查看”，汇总矩阵、跨节点比较和下方动态时间曲线会同步更新；曲线下方的平均值、最大值也按新选区重新计算。
 
 手动统计在浏览器中使用 HTML 内嵌的原始采样数据即时计算，只改变当前页面显示，不修改服务器上的 CSV 或自动稳态结果。
 
@@ -271,7 +271,8 @@ hy-smi --showmeminfo vram --json
 hy-smi --showtemp --json
 ```
 
-- DCU 利用率统一使用 `hy-smi --showhcuutil` 的最近 1 秒 HCU active ratio。
+- `hy-smi --showuse` 返回查询时刻的瞬时 CU 使用率，短脉冲负载可能恰好采到空闲值。
+- DCU 利用率统一使用 `hy-smi --showhcuutil` 的最近 1 秒 HCU active ratio：默认在 1 秒窗口内周期采样 DCU 是否活跃，以活跃采样次数占比表示利用率，更适合推理监控和稳态识别。接口语义可参考海光官方 [HYGON-AI/dcu-dcgm](https://pkg.go.dev/github.com/HYGON-AI/dcu-dcgm/v2/pkg/dcgm#DCUSampledUsage)。
 - 单卡功耗来自 `Average Graphics Package Power (W)`。
 - 显存利用率为 `已用显存 / 总显存 × 100%`。
 - 温度保留 edge、junction、memory、core，汇总默认使用 junction。
