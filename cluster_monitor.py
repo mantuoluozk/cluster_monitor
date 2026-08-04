@@ -1524,6 +1524,54 @@ def node_health_text(roles,node_health,cfg,now,started):
     return "节点采集 %d/%d正常（%s） | 异常: %s"%(healthy,total,groups,details),False
 
 
+def runtime_steady_status(cfg,mode,active_groups,roles,dcu_rows,total_elapsed):
+    """生成在线稳态/负载结束状态；最终统计仍在采集结束后重新计算。"""
+    steady=detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed)
+    settings=cfg.get("steady_state",{})
+    idle=float(settings.get("idle_threshold_pct",2))
+    idle_needed=int(settings.get("idle_confirm_samples",2))
+    expected=max(1,int(cfg.get("expected_dcu_cards_per_node",4)))
+    node_series={node:_fresh_node_util_snapshots(dcu_rows.get(node,[]),expected) for node in roles}
+    available=all(node_series.get(node) for node in roles)
+    util_fresh_limit=max(15.0,float(cfg.get("dcu_utilization_interval_s",5))*3)
+    current=available and all(total_elapsed-series[-1][0]<=util_fresh_limit for series in node_series.values())
+    latest_values={node:series[-1][1] for node,series in node_series.items() if series}
+    latest_avg=(sum(latest_values.values())/len(latest_values) if latest_values else None)
+    ever_busy=any(util>idle for series in node_series.values() for _,util in series)
+    idle_tail={}
+    for node,series in node_series.items():
+        count=0
+        for _,util in reversed(series):
+            if util<=idle:count+=1
+            else:break
+        idle_tail[node]=count
+    idle_progress=(min(idle_tail.values()) if available else 0)
+    all_nodes_idle=current and ever_busy and idle_progress>=idle_needed
+    common={"steady":steady,"latest_avg_util_pct":latest_avg,"idle_progress":min(idle_progress,idle_needed),
+            "idle_needed":idle_needed,"idle_threshold_pct":idle,"all_nodes_idle":all_nodes_idle}
+    if all_nodes_idle:
+        note="统一稳态已结束" if steady.get("start_confirmed") else "未识别到统一稳态，但负载已经结束"
+        text="%s；全部节点DCU利用率≤%.1f%%，连续%d/%d个样本，可按 Ctrl+C"%(
+            note,idle,idle_needed,idle_needed)
+        return {**common,"state":"ended","text":text}
+    if not available:
+        return {**common,"state":"waiting_samples","text":"等待全部节点DCU利用率样本"}
+    if not current:
+        return {**common,"state":"waiting_samples","text":"等待全部节点最新DCU利用率样本"}
+    if not ever_busy:
+        return {**common,"state":"waiting_load","text":"尚未检测到DCU负载"}
+    if steady.get("start_confirmed"):
+        if idle_progress:
+            text="已进入统一稳态（起点 %.1fs）；负载下降待确认 %d/%d"%(
+                steady["start_elapsed_s"],min(idle_progress,idle_needed),idle_needed)
+        else:text="已进入统一稳态（起点 %.1fs）"%steady["start_elapsed_s"]
+        return {**common,"state":"steady","text":text}
+    reason=steady.get("reason","正在累计稳定窗口")
+    if idle_progress:
+        reason="负载下降待确认 %d/%d；%s"%(min(idle_progress,idle_needed),idle_needed,reason)
+    return {**common,"state":"stabilizing","text":"检测到DCU负载，尚未进入统一稳态（%s）"%reason}
+
+
 def main():
     ap=argparse.ArgumentParser(description="PD/IFB 服务全生命周期资源监控")
     ap.add_argument("--config",default="monitor_config.jsonc")
@@ -1562,13 +1610,20 @@ def main():
                 util_thread=threading.Thread(target=spawn_dcu_util,args=(node,cfg,q,stop),daemon=True); util_thread.start(); threads.append(util_thread)
         if probe.get("enabled",False):
             thread=threading.Thread(target=probe_route,args=(cfg,q,stop,started),daemon=True); thread.start(); threads.append(thread)
-        last_status=started; first_packet_check_printed=False
+        last_status=started; first_packet_check_printed=False; last_runtime_state=None
         while not stop.is_set():
             if duration>0 and time.time()-started>=duration:stop.set(); break
             now=time.time()
             if now-last_status>=10:
                 health_text,_=node_health_text(roles,node_health,cfg,now,started)
-                print("[状态] 已运行 %.0fs | %s | 路由端口 %s"%(now-started,health_text,route_state),flush=True)
+                runtime=runtime_steady_status(cfg,mode,active_groups,roles,dcu_rows,now-started)
+                if runtime["state"]!=last_runtime_state:
+                    if runtime["state"]=="steady":print("[稳态] "+runtime["text"],flush=True)
+                    elif runtime["state"]=="ended":print("[稳态] "+runtime["text"],flush=True)
+                    last_runtime_state=runtime["state"]
+                util_text="--" if runtime["latest_avg_util_pct"] is None else "%.1f%%"%runtime["latest_avg_util_pct"]
+                print("[状态] 已运行 %.0fs | %s | 集群DCU %s | %s | 路由端口 %s"%(
+                    now-started,health_text,util_text,runtime["text"],route_state),flush=True)
                 last_status=now
             try:node,sample,err=q.get(timeout=.5)
             except queue.Empty:
