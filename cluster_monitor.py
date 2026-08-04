@@ -1432,7 +1432,7 @@ def _dashboard_node_metrics(host_rows,dcu_rows):
 
 
 def _dashboard_manual_series(host_rows,dcu_rows):
-    """生成供离线 HTML 手动选区使用的紧凑时间序列：[秒, 平均口径值, 最大口径值]。"""
+    """生成离线手动选区需要的汇总序列和与静态 SVG 同口径的真实曲线。"""
     series={key:[] for key in ("cpu_util","cpu_temp","cpu_power","memory_used","memory_util",
                                 "dcu_util","vram_util","dcu_power_total","dcu_temp","node_power")}
     host_defs={
@@ -1463,7 +1463,27 @@ def _dashboard_manual_series(host_rows,dcu_rows):
     elapsed_values=[float(row["elapsed_s"]) for row in host_rows if row.get("elapsed_s") not in (None,"")]
     if not elapsed_values:
         elapsed_values=[float(row["elapsed_s"]) for row in dcu_rows if row.get("elapsed_s") not in (None,"")]
-    return {"max_elapsed_s":max(elapsed_values) if elapsed_values else 0.0,"metrics":series}
+    def host_points(key):
+        return [[float(row["elapsed_s"]),float(row[key])] for row in host_rows
+                if row.get("elapsed_s") not in (None,"") and row.get(key) not in (None,"")]
+    cards=sorted({row.get("dcu_index") for row in dcu_rows if row.get("dcu_index") not in (None,"")},key=str)
+    def card_lines(key):
+        return [{"label":"DCU%s"%card,"points":[[float(row["elapsed_s"]),float(row[key])] for row in dcu_rows
+                if row.get("dcu_index")==card and row.get("elapsed_s") not in (None,"") and row.get(key) not in (None,"")]}
+                for card in cards]
+    charts=[
+        {"label":"CPU利用率","unit":"%","series":[{"label":"CPU","points":host_points("cpu_util_pct")}]},
+        {"label":"CPU频率","unit":"MHz","series":[{"label":"平均频率","points":host_points("cpu_freq_avg_mhz")},{"label":"最高频率","points":host_points("cpu_freq_max_mhz")}]},
+        {"label":"CPU温度","unit":"°C","series":[{"label":"平均温度","points":host_points("cpu_temp_avg_c")},{"label":"最高温度","points":host_points("cpu_temp_max_c")}]},
+        {"label":"CPU功耗","unit":"W","series":[{"label":"CPU","points":host_points("cpu_power_w")}]},
+        {"label":"内存利用率","unit":"%","series":[{"label":"内存","points":host_points("host_mem_util_pct")}]},
+        {"label":"整机功耗","unit":"W","series":[{"label":"整机","points":host_points("node_power_w")}]},
+        {"label":"DCU利用率（最近1秒HCU活跃占比）","unit":"%","series":card_lines("dcu_util_pct")},
+        {"label":"DCU显存利用率","unit":"%","series":card_lines("dcu_mem_util_pct")},
+        {"label":"DCU功耗","unit":"W","series":card_lines("dcu_power_w")},
+        {"label":"DCU温度","unit":"°C","series":card_lines("dcu_temp_c")},
+    ]
+    return {"max_elapsed_s":max(elapsed_values) if elapsed_values else 0.0,"metrics":series,"charts":charts}
 
 
 def make_dashboard(path,model,node_infos,full_host,full_dcu,shared_host,shared_dcu,node_host,node_dcu,shared_steady,node_steady,started):
@@ -1570,7 +1590,6 @@ def make_dashboard(path,model,node_infos,full_host,full_dcu,shared_host,shared_d
 <script>(function(){
 const data=JSON.parse(document.getElementById('manual-data').textContent),nodes=Object.keys(data.nodes),scopeButtons=[...document.querySelectorAll('[data-select-scope]')],scopeContents=[...document.querySelectorAll('.scope-content')],roleButtons=[...document.querySelectorAll('.role-tab')],nodeGroups=[...document.querySelectorAll('.node-tabs')],nodeButtons=[...document.querySelectorAll('.node-tab')],panels=[...document.querySelectorAll('.detail-panel')],manualPanel=document.getElementById('manual-panel'),nodeField=document.getElementById('manual-node-field'),nodeSelect=document.getElementById('manual-node'),startInput=document.getElementById('manual-start'),endInput=document.getElementById('manual-end'),startRange=document.getElementById('manual-start-range'),endRange=document.getElementById('manual-end-range'),rangeShell=document.getElementById('manual-range-shell'),previewSvg=document.getElementById('manual-preview-svg'),previewLegend=document.getElementById('manual-preview-legend'),previewMode=document.getElementById('manual-preview-mode'),status=document.getElementById('manual-status'),summary=document.getElementById('manual-summary');
 let manualMode='shared',sharedInterval={start:0,end:Math.max(0,...nodes.map(n=>data.nodes[n].max_elapsed_s))},nodeIntervals={};nodes.forEach(n=>nodeIntervals[n]={start:0,end:data.nodes[n].max_elapsed_s});
-const manualMetricDefs=[['cpu_util','CPU利用率','%'],['cpu_temp','CPU温度','°C'],['cpu_power','CPU功耗','W'],['memory_used','内存占用','GiB'],['memory_util','内存利用率','%'],['dcu_util','DCU利用率','%'],['vram_util','显存利用率','%'],['dcu_power_total','DCU总功耗','W'],['dcu_temp','DCU温度','°C'],['node_power','整机功耗','W']];
 const number=v=>v==null||!Number.isFinite(v)?'--':v.toFixed(2),esc=s=>String(s).replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c])),clock=s=>new Date((data.started_epoch+s)*1000).toLocaleString('zh-CN',{hour12:false}),currentNode=()=>nodeSelect.value||nodes[0],currentInterval=()=>manualMode==='shared'?sharedInterval:nodeIntervals[currentNode()],limit=()=>manualMode==='shared'?Math.max(0,...nodes.map(n=>data.nodes[n].max_elapsed_s)):data.nodes[currentNode()].max_elapsed_s;
 function clamp(v,low,high){return Math.max(low,Math.min(high,Number.isFinite(v)?v:low))}function normalize(interval,max){interval.start=clamp(Number(interval.start),0,max);interval.end=clamp(Number(interval.end),0,max);if(interval.start>interval.end){const t=interval.start;interval.start=interval.end;interval.end=t}return interval}
 function renderPreview(){const max=Math.max(.001,limit()),i=normalize(currentInterval(),max),left=58,right=1180,top=18,bottom=210,width=right-left,height=bottom-top,palette=['#1769aa','#5b8fd1','#008f95','#42aaa5','#7857a8','#e05a24','#16845b','#9b6b43'],x=t=>left+width*clamp(t,0,max)/max,y=v=>bottom-height*clamp(v,0,100)/100,pathFor=(points,index)=>{const valid=points.filter(p=>Number.isFinite(p[index]));return valid.map((p,n)=>(n?'L':'M')+x(p[0]).toFixed(1)+' '+y(p[index]).toFixed(1)).join(' ')},series=[];if(manualMode==='shared'){nodes.forEach((node,index)=>series.push({label:data.nodes[node].role+' / '+node,color:palette[index%palette.length],dash:'',path:pathFor(data.nodes[node].metrics.dcu_util,1)}));previewMode.textContent='全部节点四卡平均'}else{const node=currentNode(),points=data.nodes[node].metrics.dcu_util;series.push({label:node+' 四卡平均',color:'#1769aa',dash:'',path:pathFor(points,1)});series.push({label:node+' 单卡最大',color:'#e05a24',dash:'8 5',path:pathFor(points,2)});previewMode.textContent=data.nodes[node].role+' / '+node}let svg='<rect x="'+left+'" y="'+top+'" width="'+width+'" height="'+height+'" fill="#fff"/>';[0,25,50,75,100].forEach(value=>{const gy=y(value);svg+='<line x1="'+left+'" y1="'+gy+'" x2="'+right+'" y2="'+gy+'" stroke="#dce5ec"/><text x="'+(left-9)+'" y="'+(gy+4)+'" text-anchor="end" font-size="11" fill="#60798d">'+value+'</text>'});const sx=x(i.start),ex=x(i.end);svg+='<rect x="'+sx+'" y="'+top+'" width="'+Math.max(0,ex-sx)+'" height="'+height+'" fill="#e05a24" opacity=".12"/>';series.forEach(item=>{if(item.path)svg+='<path d="'+item.path+'" fill="none" stroke="'+item.color+'" stroke-width="2" stroke-dasharray="'+item.dash+'" vector-effect="non-scaling-stroke"/>'});svg+='<line x1="'+sx+'" y1="'+top+'" x2="'+sx+'" y2="'+bottom+'" stroke="#e05a24" stroke-width="2"/><line x1="'+ex+'" y1="'+top+'" x2="'+ex+'" y2="'+bottom+'" stroke="#e05a24" stroke-width="2"/>';for(let tick=0;tick<5;tick++){const elapsed=max*tick/4,tx=x(elapsed);svg+='<text x="'+tx+'" y="232" text-anchor="middle" font-size="11" fill="#60798d">'+elapsed.toFixed(1)+'s</text>'}previewSvg.innerHTML=svg;previewLegend.innerHTML=series.map(item=>'<span class="preview-key" style="--key-color:'+item.color+'">'+esc(item.label)+'</span>').join('')}
@@ -1578,17 +1597,19 @@ function loadControls(){const max=limit(),i=normalize(currentInterval(),max);[st
 function saveControls(source){const max=limit(),i=currentInterval();if(source==='start-number'||source==='start-range')i.start=Math.min(Number(source==='start-number'?startInput.value:startRange.value),i.end);if(source==='end-number'||source==='end-range')i.end=Math.max(Number(source==='end-number'?endInput.value:endRange.value),i.start);normalize(i,max);loadControls()}function commitControls(){const i=currentInterval();i.start=Number(startInput.value);i.end=Number(endInput.value);normalize(i,limit());loadControls()}
 function stats(points,interval){const selected=points.filter(p=>p[0]>=interval.start&&p[0]<=interval.end),avgs=selected.map(p=>p[1]).filter(Number.isFinite),maxs=selected.map(p=>p[2]).filter(Number.isFinite);return {avg:avgs.length?avgs.reduce((a,b)=>a+b,0)/avgs.length:null,max:maxs.length?Math.max(...maxs):null,count:selected.length}}
 function intervalFor(node){return manualMode==='shared'?sharedInterval:nodeIntervals[node]}
-function renderManualChart(chart,node,result){
-  const max=Math.max(.001,data.nodes[node].max_elapsed_s),interval=normalize(intervalFor(node),max),W=1200,left=72,right=1170,rowH=170,plotH=92,totalH=manualMetricDefs.length*rowH+25;
+function renderManualChart(chart,node){
+  const chartDefs=data.nodes[node].charts||[],max=Math.max(.001,data.nodes[node].max_elapsed_s),interval=normalize(intervalFor(node),max),W=1200,left=72,right=1170,rowH=190,plotH=100,totalH=chartDefs.length*rowH+25,palette=['#2563eb','#dc2626','#16a34a','#9333ea','#ea580c','#0891b2','#be123c','#4f46e5'];
   const x=t=>left+(right-left)*clamp(t,0,max)/max;
-  const path=(points,index,y,ymax)=>points.filter(p=>Number.isFinite(p[index])).map((p,n)=>(n?'L':'M')+x(p[0]).toFixed(1)+' '+(y+plotH-plotH*clamp(p[index],0,ymax)/ymax).toFixed(1)).join(' ');
-  let svg='<svg viewBox="0 0 '+W+' '+totalH+'" xmlns="http://www.w3.org/2000/svg" aria-label="'+esc(node)+' 手动区间指标曲线">';
-  manualMetricDefs.forEach(([key,label,unit],idx)=>{
-    const points=data.nodes[node].metrics[key]||[],values=points.flatMap(p=>[p[1],p[2]]).filter(Number.isFinite),ymax=unit==='%'?100:Math.max(1,...values)*1.08,y=idx*rowH+34,sx=x(interval.start),ex=x(interval.end),value=result[key]||{avg:null,max:null};
-    svg+='<text x="'+left+'" y="'+(y-13)+'" font-size="14" font-weight="700" fill="#0b1f33">'+esc(label)+' ('+esc(unit)+')</text><rect x="'+left+'" y="'+y+'" width="'+(right-left)+'" height="'+plotH+'" fill="#fff"/>';
-    [0,.5,1].forEach(r=>{const gy=y+plotH*(1-r);svg+='<line x1="'+left+'" y1="'+gy+'" x2="'+right+'" y2="'+gy+'" stroke="#dce5ec"/><text x="'+(left-8)+'" y="'+(gy+4)+'" text-anchor="end" font-size="10" fill="#60798d">'+(ymax*r).toFixed(unit==='%'?0:1)+'</text>'});
-    svg+='<rect x="'+sx+'" y="'+y+'" width="'+Math.max(0,ex-sx)+'" height="'+plotH+'" fill="#e05a24" opacity=".12"/><path d="'+path(points,1,y,ymax)+'" fill="none" stroke="#1769aa" stroke-width="2" vector-effect="non-scaling-stroke"/><path d="'+path(points,2,y,ymax)+'" fill="none" stroke="#e05a24" stroke-width="1.5" stroke-dasharray="7 4" vector-effect="non-scaling-stroke"/><line x1="'+sx+'" y1="'+y+'" x2="'+sx+'" y2="'+(y+plotH)+'" stroke="#e05a24"/><line x1="'+ex+'" y1="'+y+'" x2="'+ex+'" y2="'+(y+plotH)+'" stroke="#e05a24"/><text x="'+left+'" y="'+(y+119)+'" font-size="11" fill="#1769aa">● 平均口径曲线</text><text x="'+(left+130)+'" y="'+(y+119)+'" font-size="11" fill="#e05a24">- - 最大口径曲线</text><text x="'+(left+285)+'" y="'+(y+119)+'" font-size="12" font-weight="700" fill="#314c61">手动区间：平均 '+number(value.avg)+' / 最大 '+number(value.max)+'</text>';
-    if(idx===manualMetricDefs.length-1){for(let tick=0;tick<5;tick++){const elapsed=max*tick/4;svg+='<text x="'+x(elapsed)+'" y="'+(y+145)+'" text-anchor="middle" font-size="10" fill="#60798d">'+elapsed.toFixed(1)+'s</text>'}}
+  const path=(points,y,ymax)=>points.filter(p=>Number.isFinite(p[1])).map((p,n)=>(n?'L':'M')+x(p[0]).toFixed(1)+' '+(y+plotH-plotH*clamp(p[1],0,ymax)/ymax).toFixed(1)).join(' ');
+  const selectedStats=points=>{const values=points.filter(p=>p[0]>=interval.start&&p[0]<=interval.end&&Number.isFinite(p[1])).map(p=>p[1]);return {avg:values.length?values.reduce((a,b)=>a+b,0)/values.length:null,max:values.length?Math.max(...values):null}};
+  let svg='<svg viewBox="0 0 '+W+' '+totalH+'" xmlns="http://www.w3.org/2000/svg" aria-label="'+esc(node)+' 手动区间实际指标曲线">';
+  chartDefs.forEach((definition,idx)=>{
+    const lines=definition.series||[],values=lines.flatMap(line=>line.points.map(point=>point[1])).filter(Number.isFinite),ymax=definition.unit==='%'?100:Math.max(1,...values)*1.08,y=idx*rowH+34,sx=x(interval.start),ex=x(interval.end);
+    svg+='<text x="'+left+'" y="'+(y-13)+'" font-size="14" font-weight="700" fill="#0b1f33">'+esc(definition.label)+' ('+esc(definition.unit)+')</text><rect x="'+left+'" y="'+y+'" width="'+(right-left)+'" height="'+plotH+'" fill="#fff"/>';
+    [0,.5,1].forEach(r=>{const gy=y+plotH*(1-r);svg+='<line x1="'+left+'" y1="'+gy+'" x2="'+right+'" y2="'+gy+'" stroke="#dce5ec"/><text x="'+(left-8)+'" y="'+(gy+4)+'" text-anchor="end" font-size="10" fill="#60798d">'+(ymax*r).toFixed(definition.unit==='%'?0:1)+'</text>'});
+    svg+='<rect x="'+sx+'" y="'+y+'" width="'+Math.max(0,ex-sx)+'" height="'+plotH+'" fill="#e05a24" opacity=".12"/><line x1="'+sx+'" y1="'+y+'" x2="'+sx+'" y2="'+(y+plotH)+'" stroke="#e05a24"/><line x1="'+ex+'" y1="'+y+'" x2="'+ex+'" y2="'+(y+plotH)+'" stroke="#e05a24"/>';
+    lines.forEach((line,lineIndex)=>{const color=palette[lineIndex%palette.length],value=selectedStats(line.points),legendX=left+(lineIndex%2)*520,legendY=y+126+Math.floor(lineIndex/2)*18;svg+='<path d="'+path(line.points,y,ymax)+'" fill="none" stroke="'+color+'" stroke-width="2" vector-effect="non-scaling-stroke"/><line x1="'+legendX+'" y1="'+(legendY-4)+'" x2="'+(legendX+18)+'" y2="'+(legendY-4)+'" stroke="'+color+'" stroke-width="3"/><text x="'+(legendX+24)+'" y="'+legendY+'" font-size="11" fill="#314c61">'+esc(line.label)+'  平均 '+number(value.avg)+' / 最大 '+number(value.max)+'</text>'});
+    if(idx===chartDefs.length-1){for(let tick=0;tick<5;tick++){const elapsed=max*tick/4;svg+='<text x="'+x(elapsed)+'" y="'+(y+174)+'" text-anchor="middle" font-size="10" fill="#60798d">'+elapsed.toFixed(1)+'s</text>'}}
   });
   svg+='</svg>';chart.querySelector('.manual-dynamic-chart').innerHTML=svg;chart.querySelector('.manual-chart-label').textContent='手动区间 '+interval.start.toFixed(1)+'s–'+interval.end.toFixed(1)+'s（'+clock(interval.start)+' → '+clock(interval.end)+'）';
 }
@@ -1597,7 +1618,7 @@ function recalc(){
   nodes.forEach(node=>{results[node]={};const interval=intervalFor(node);Object.entries(data.nodes[node].metrics).forEach(([key,points])=>results[node][key]=stats(points,interval))});
   document.querySelectorAll('.manual-value').forEach(el=>{const value=results[el.dataset.node][el.dataset.metric];el.querySelector('.avg').textContent=number(value.avg);el.querySelector('.max').textContent=number(value.max)});
   document.querySelectorAll('[data-manual-compare]').forEach(container=>{const key=container.dataset.manualCompare,scale=Math.max(1,...nodes.map(n=>results[n][key].max||0));container.innerHTML=nodes.map(node=>{const value=results[node][key],role=data.nodes[node].role.toLowerCase(),aw=value.avg==null?0:Math.min(100,value.avg*100/scale),ml=value.max==null?0:Math.min(100,value.max*100/scale);return '<div class="bar-row"><span class="bar-node"><i class="role-dot role-'+esc(role)+'"></i>'+esc(node)+'</span><div class="bar-track"><span class="bar-fill role-bg-'+esc(role)+'" style="width:'+aw.toFixed(3)+'%"></span>'+(value.max==null?'':'<i class="maximum-marker" style="left:'+ml.toFixed(3)+'%"></i>')+'</div><span class="bar-value">'+number(value.avg)+' / '+number(value.max)+'</span></div>'}).join('')});
-  document.querySelectorAll('.manual-chart').forEach(chart=>renderManualChart(chart,chart.dataset.node,results[chart.dataset.node]));
+  document.querySelectorAll('.manual-chart').forEach(chart=>renderManualChart(chart,chart.dataset.node));
   if(manualMode==='shared'){summary.textContent='手动统一区间 · '+sharedInterval.start.toFixed(1)+'s–'+sharedInterval.end.toFixed(1)+'s';status.textContent='已对全部 '+nodes.length+' 个节点应用统一区间：'+clock(sharedInterval.start)+' → '+clock(sharedInterval.end)}else{summary.textContent='手动节点独立区间 · '+nodes.length+' 个节点分别设置';const n=currentNode(),i=nodeIntervals[n];status.textContent='已按节点分别统计；当前 '+n+'：'+i.start.toFixed(1)+'s–'+i.end.toFixed(1)+'s'}
   showScope('manual');
 }
