@@ -34,6 +34,9 @@ class ClusterMonitorTests(unittest.TestCase):
         self.assertNotIn("received_timestamp", monitor.ONE_SECOND_FIELDS)
         self.assertNotIn("node_clock_offset_s", monitor.ONE_SECOND_FIELDS)
         self.assertNotIn("phase", monitor.ONE_SECOND_FIELDS)
+        for card in range(4):
+            self.assertNotIn("dcu%d_core_clock_mhz" % card, monitor.ONE_SECOND_FIELDS)
+            self.assertNotIn("dcu%d_mem_clock_mhz" % card, monitor.ONE_SECOND_FIELDS)
 
     def test_combined_hy_smi_output_is_parsed(self):
         raw = (

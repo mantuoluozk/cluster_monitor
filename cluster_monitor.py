@@ -32,7 +32,7 @@ FIELDS = [
     "host_mem_cache_mib", "host_mem_util_pct", "swap_used_mib", "swap_util_pct",
     "node_power_w", "dcu_index", "dcu_mem_used_mib", "dcu_mem_total_mib",
     "dcu_mem_util_pct", "dcu_util_pct", "dcu_power_w", "dcu_temp_c",
-    "dcu_core_clock_mhz", "dcu_mem_clock_mhz", "error",
+    "error",
 ]
 
 IB_FIELDS = [
@@ -50,7 +50,7 @@ NODE_METRICS = ["cpu_util_pct","cpu_user_pct","cpu_system_pct","cpu_iowait_pct",
     "load_1m","load_5m","load_15m","host_mem_used_mib","host_mem_available_mib",
     "host_mem_cache_mib","host_mem_util_pct","swap_used_mib","swap_util_pct","cpu_power_w","node_power_w"]
 DCU_METRICS = ["util_pct","mem_used_mib","mem_total_mib","mem_util_pct","power_w",
-    "temp_c","temp_edge_c","temp_junction_c","temp_mem_c","temp_core_c","core_clock_mhz","mem_clock_mhz"]
+    "temp_c","temp_edge_c","temp_junction_c","temp_mem_c","temp_core_c"]
 COMPLETE_FIELDS = ["timestamp","elapsed_s","node","role","phase",*NODE_METRICS,
     "dcu_count","dcu_util_avg_pct","dcu_util_max_pct","dcu_mem_used_total_mib",
     "dcu_mem_total_mib","dcu_mem_util_pct","dcu_power_total_w"] + [f"dcu{i}_{m}" for i in range(4) for m in DCU_METRICS] + [
@@ -73,7 +73,7 @@ CORE_FIELDS = [
 ]
 
 DEFAULT_METRICS = {k:True for k in ["cpu","cpu_power","load","host_memory","swap","node_power",
-    "dcu_utilization","dcu_memory","dcu_power","dcu_temperature","dcu_clock",
+    "dcu_utilization","dcu_memory","dcu_power","dcu_temperature",
     "ib_throughput","ib_packets","ib_link","ib_errors"]}
 
 
@@ -93,7 +93,6 @@ def metric_group(field):
         if "mem_" in field:return "dcu_memory"
         if "power" in field:return "dcu_power"
         if "temp" in field:return "dcu_temperature"
-        if "clock" in field:return "dcu_clock"
         return "dcu_utilization"
     return None
 
@@ -243,15 +242,11 @@ def json_cards(text):
         _,mem_pct=find_value(x,('memory','use'))
         if mem_pct is None: _,mem_pct=find_value(x,('memory','util'))
         _,temp=find_value(x,('temp',))
-        _,core_clock=find_value(x,('sclk',))
-        if core_clock is None: _,core_clock=find_value(x,('core','clock'))
-        _,mem_clock=find_value(x,('mclk',))
-        if mem_clock is None: _,mem_clock=find_value(x,('memory','clock'))
         mem_used_norm=mib(mem_used,mk); mem_total_norm=mib(mem_total,tk); mem_pct_norm=number(mem_pct)
         if (mem_pct_norm is None or mem_pct_norm>100) and mem_total_norm: mem_pct_norm=100*mem_used_norm/mem_total_norm
         cards.append({'index':idx,'util_pct':number(util),'power_w':number(power),
             'mem_used_mib':mem_used_norm,'mem_total_mib':mem_total_norm,'mem_util_pct':mem_pct_norm,
-            'temp_c':number(temp),'core_clock_mhz':number(core_clock),'mem_clock_mhz':number(mem_clock)})
+            'temp_c':number(temp)})
     return cards
 
 def text_cards(text):
@@ -509,7 +504,7 @@ def parse_dcu_output(text):
         if mp is None:_,mp=_find(x,('memory','util'))
         _,temp_edge=_find(x,('temp','edge')); _,temp_junction=_find(x,('temp','junction'))
         _,temp_mem=_find(x,('temp','mem')); _,temp_core=_find(x,('temp','core'))
-        _,temp_any=_find(x,('temp',)); _,cc=_find(x,('sclk',)); _,mc=_find(x,('mclk',))
+        _,temp_any=_find(x,('temp',))
         mu_norm=_mib(mu,mk); mt_norm=_mib(mt,tk); mp_norm=_num(mp)
         # hy-smi 的 "Total Used Memory" 同时包含 memory/use 关键词，不能把很小的
         # 已用 MiB（例如 2 MiB）误当成 2%。容量齐全时始终以容量计算占用率。
@@ -518,8 +513,7 @@ def parse_dcu_output(text):
           'mem_total_mib':mt_norm,'mem_util_pct':mp_norm,
           'temp_c':(_num(temp_junction) if _num(temp_junction) is not None else _num(temp_edge) if _num(temp_edge) is not None else _num(temp_any)),
           'temp_edge_c':_num(temp_edge),'temp_junction_c':_num(temp_junction),
-          'temp_mem_c':_num(temp_mem),'temp_core_c':_num(temp_core),
-          'core_clock_mhz':_num(cc),'mem_clock_mhz':_num(mc)})
+          'temp_mem_c':_num(temp_mem),'temp_core_c':_num(temp_core)})
     return cards
 
 
@@ -780,8 +774,7 @@ def rows_for_sample(sample, node, role, started, phase, err=""):
     for c in cards:
         r=dict(base); r.update({"dcu_index":c.get("index"),"dcu_mem_used_mib":c.get("mem_used_mib"),
             "dcu_mem_total_mib":c.get("mem_total_mib"),"dcu_mem_util_pct":c.get("mem_util_pct"),
-            "dcu_util_pct":c.get("util_pct"),"dcu_power_w":c.get("power_w"),"dcu_temp_c":c.get("temp_c"),
-            "dcu_core_clock_mhz":c.get("core_clock_mhz"),"dcu_mem_clock_mhz":c.get("mem_clock_mhz")}); result.append(r)
+            "dcu_util_pct":c.get("util_pct"),"dcu_power_w":c.get("power_w"),"dcu_temp_c":c.get("temp_c")}); result.append(r)
     return result
 
 
@@ -1060,7 +1053,6 @@ def legacy_main():
                 cards=sample.get("dcus",[]); missing=[]
                 if cards and metrics.get("dcu_memory") and not any(c.get("mem_used_mib") is not None for c in cards):missing.append("DCU显存")
                 if cards and metrics.get("dcu_temperature") and not any(c.get("temp_c") is not None for c in cards):missing.append("DCU温度")
-                if cards and metrics.get("dcu_clock") and not any(c.get("core_clock_mhz") is not None for c in cards):missing.append("DCU时钟")
                 if metrics.get("cpu_power") and sample.get("cpu_power_w") is None:missing.append("CPU功耗")
                 if metrics.get("node_power") and sample.get("node_power_w") is None:missing.append("整机功耗")
                 if missing:msg+="; 未取到="+",".join(missing)+"（汇总显示--）"
