@@ -73,6 +73,12 @@
   // 全部基础指标按固定节拍采集；程序会扣除命令耗时，避免实际周期变成“命令耗时+1秒”。
   "sample_interval_s": 1,
 
+  // 完整数据始终流式写入 CSV；内存只保留最近这些秒用于运行状态判断。
+  "runtime_memory_window_s": 300,
+
+  // HTML/SVG 每节点最多保留的绘图点数；summary.csv 仍流式统计全部样本。
+  "report_max_points_per_node": 3600,
+
   // 下列指标也每秒执行一次；命令失败时仅复用最近一次成功值。
   "dcu_utilization_interval_s": 1,      // 仅在启用下面的独立利用率命令时使用
   "dcu_memory_interval_s": 1,           // 显存容量与占用量

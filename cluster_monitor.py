@@ -60,10 +60,9 @@ COMPLETE_FIELDS = ["timestamp","elapsed_s","node","role","phase",*NODE_METRICS,
 
 # 面向用户直接检查逐秒数据：每个节点每秒一行，四张 DCU 横向展开。
 # timestamp 是唯一业务时间戳；elapsed_s 仅是从本次监控开始计算的秒序号。
-_ONE_SECOND_PREFIX = ["timestamp","elapsed_s","role","node",
-                      "route_state","route_event","phase","shared_phase","node_phase"]
+_ONE_SECOND_PREFIX = ["timestamp","elapsed_s","role","node","route_state","route_event"]
 ONE_SECOND_FIELDS = _ONE_SECOND_PREFIX + [field for field in COMPLETE_FIELDS
-                                          if field not in _ONE_SECOND_PREFIX and field!="ib_ports_json"]
+                                          if field not in set(_ONE_SECOND_PREFIX + ["phase","ib_ports_json"])]
 
 # 面向日常查看的必需指标窄表。字段名直接携带单位，不受 metrics 输出开关裁剪。
 CORE_FIELDS = [
@@ -1180,7 +1179,16 @@ def _fresh_node_util_snapshots(rows,expected_cards=4):
     return [(elapsed,sum(cards.values())/len(cards)) for elapsed,cards in sorted(grouped.items()) if len(cards)>=expected_cards]
 
 
-def _detect_steady_state_single(cfg,mode,active_groups,dcu_rows,total_elapsed):
+def _sample_for_report(items,limit):
+    """等距保留用于 JSON/HTML 的点，避免报告体积随运行时长无限增长。"""
+    if len(items)<=limit:return list(items)
+    step=max(1,int(math.ceil(len(items)/float(limit))))
+    sampled=list(items[::step])
+    if sampled[-1]!=items[-1]:sampled.append(items[-1])
+    return sampled
+
+
+def _detect_steady_state_single(cfg,mode,active_groups,dcu_rows,total_elapsed,util_series=None):
     settings=cfg.get("steady_state",{})
     result={"status":"not_detected","start_elapsed_s":None,"end_elapsed_s":None,
             "duration_s":None,"start_confirmed":False,"end_confirmed":False,"reference_group":None,
@@ -1196,7 +1204,8 @@ def _detect_steady_state_single(cfg,mode,active_groups,dcu_rows,total_elapsed):
     if not nodes:
         result["reason"]="参考组没有生效节点"; return result
     expected_cards=max(1,int(cfg.get("expected_dcu_cards_per_node",4)))
-    per_node={node:_fresh_node_util_snapshots(dcu_rows.get(node,[]),expected_cards) for node in nodes}
+    per_node=({node:list(util_series.get(node,[])) for node in nodes} if util_series is not None else
+              {node:_fresh_node_util_snapshots(dcu_rows.get(node,[]),expected_cards) for node in nodes})
     if any(not samples for samples in per_node.values()):
         result["reason"]="参考组存在没有有效 DCU 利用率样本的节点"; return result
     anchor=max(nodes,key=lambda node:len(per_node[node])); tolerance=max(1.5,float(cfg.get("dcu_utilization_interval_s",1))*.45)
@@ -1214,7 +1223,9 @@ def _detect_steady_state_single(cfg,mode,active_groups,dcu_rows,total_elapsed):
         if dedup and abs(sample["elapsed_s"]-dedup[-1]["elapsed_s"])<.75:
             dedup[-1]=sample
         else:dedup.append(sample)
-    series=dedup; result["fresh_samples"]=series
+    series=dedup
+    result["fresh_sample_count"]=len(series)
+    result["fresh_samples"]=_sample_for_report(series,max(100,int(cfg.get("report_max_points_per_node",3600))))
     window=int(settings.get("window_fresh_samples",6)); confirmations=int(settings.get("confirm_windows",2))
     active=float(settings.get("active_threshold_pct",5)); max_change=float(settings.get("max_half_mean_change_pct",10))
     consecutive=0; confirm_index=None; reference_mean=None
@@ -1272,17 +1283,17 @@ def _steady_candidate_summary(result):
     return {key:result.get(key) for key in keys if result.get(key) is not None}
 
 
-def detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed):
+def detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed,util_series=None):
     """统一稳态：PD 的 AUTO 分别评估 P/D，选择更稳定且持续时间有效的候选区间。"""
     settings=cfg.get("steady_state",{})
     requested=str(settings.get("reference_group","AUTO")).upper()
     if mode!="PD" or requested!="AUTO":
-        return _detect_steady_state_single(cfg,mode,active_groups,dcu_rows,total_elapsed)
+        return _detect_steady_state_single(cfg,mode,active_groups,dcu_rows,total_elapsed,util_series)
     candidates={}
     for role in ("P","D"):
         if not active_groups.get(role):continue
         role_cfg={**cfg,"steady_state":{**settings,"reference_group":role}}
-        candidates[role]=_detect_steady_state_single(role_cfg,mode,active_groups,dcu_rows,total_elapsed)
+        candidates[role]=_detect_steady_state_single(role_cfg,mode,active_groups,dcu_rows,total_elapsed,util_series)
     minimum_duration=max(float(cfg.get("dcu_utilization_interval_s",1)),
                          (int(settings.get("window_fresh_samples",6))-1)*float(cfg.get("dcu_utilization_interval_s",1)))
     valid={role:result for role,result in candidates.items()
@@ -1297,7 +1308,7 @@ def detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed):
         result["auto_selected_group"]=selected_role
     else:
         # 保留样本最完整的失败结果，便于终端继续显示具体未满足原因。
-        selected_role,selected=max(candidates.items(),key=lambda item:len(item[1].get("fresh_samples",[]))) if candidates else (None,{})
+        selected_role,selected=max(candidates.items(),key=lambda item:item[1].get("fresh_sample_count",0)) if candidates else (None,{})
         result=dict(selected)
         result["status"]="not_detected"; result["start_elapsed_s"]=None; result["end_elapsed_s"]=None
         result["duration_s"]=None; result["start_confirmed"]=False; result["end_confirmed"]=False
@@ -1309,12 +1320,12 @@ def detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed):
     return result
 
 
-def detect_node_steady_states(cfg,roles,dcu_rows,total_elapsed):
+def detect_node_steady_states(cfg,roles,dcu_rows,total_elapsed,util_series=None):
     """每个节点使用自己的四卡平均利用率，独立计算稳态区间。"""
     results={}
     for node,role in roles.items():
         node_cfg={**cfg,"steady_state":{**cfg.get("steady_state",{}),"reference_group":"NODE"}}
-        result=detect_steady_state(node_cfg,"NODE",{"NODE":[node]},{node:dcu_rows.get(node,[])},total_elapsed)
+        result=detect_steady_state(node_cfg,"NODE",{"NODE":[node]},{node:dcu_rows.get(node,[])},total_elapsed,util_series)
         result.update({"scope":"per_node","node":node,"role":role,"reference_group":role,"reference_nodes":[node]})
         results[node]=result
     return results
@@ -1380,6 +1391,142 @@ def build_node_summary(role,node,host_rows,dcu_rows):
 def write_csv(path,fields,rows):
     with open(path,"w",newline="",encoding="utf-8-sig") as stream:
         writer=csv.DictWriter(stream,fieldnames=fields,extrasaction="ignore"); writer.writeheader(); writer.writerows(rows)
+
+
+def _csv_float(row,key):
+    value=row.get(key)
+    try:return float(value) if value not in (None,"") else None
+    except (TypeError,ValueError):return None
+
+
+def load_util_series(path,roles):
+    """从已落盘的逐秒 CSV 读取每节点四卡平均利用率。
+
+    内存中只保留 (elapsed, average) 二元组，不再保留所有指标字典。
+    """
+    result={node:[] for node in roles}
+    with open(path,"r",newline="",encoding="utf-8-sig") as stream:
+        for row in csv.DictReader(stream):
+            node=row.get("node")
+            if node not in result:continue
+            values=[_csv_float(row,"dcu%d_util_pct"%index) for index in range(4)]
+            values=[value for value in values if value is not None]
+            elapsed=_csv_float(row,"elapsed_s")
+            if elapsed is not None and values:result[node].append((elapsed,sum(values)/len(values)))
+    return result
+
+
+def build_report_from_csv(path,roles,shared_steady,node_steady,total_elapsed,max_points=3600):
+    """流式计算精确汇总，只保留有限数量的 HTML/SVG 绘图点。"""
+    max_points=max(100,int(max_points)); stride=max(1,int(math.ceil(max(1.0,total_elapsed)/max_points)))
+    sampled_host={node:[] for node in roles}; sampled_dcu={node:[] for node in roles}
+    stats={}; summary_stats={}; last_rows={}
+
+    def update(target,key,average_value,maximum_value=None):
+        if average_value is None and maximum_value is None:return
+        item=target.setdefault(key,[0,0.0,None])
+        if average_value is not None:item[0]+=1; item[1]+=average_value
+        candidate=maximum_value if maximum_value is not None else average_value
+        if candidate is not None:item[2]=candidate if item[2] is None else max(item[2],candidate)
+
+    host_specs=[
+        ("cpu_util","CPU","host","cpu_utilization","%","cpu_util_pct","cpu_util_pct"),
+        ("cpu_frequency","CPU","host","cpu_frequency","MHz","cpu_freq_avg_mhz","cpu_freq_max_mhz"),
+        ("cpu_temp","CPU","host","cpu_temperature","C","cpu_temp_avg_c","cpu_temp_max_c"),
+        ("cpu_power","CPU","host","cpu_power","W","cpu_power_w","cpu_power_w"),
+        ("memory_used","Memory","host","memory_used","GiB","host_mem_used_mib","host_mem_used_mib"),
+        ("memory_util","Memory","host","memory_utilization","%","host_mem_util_pct","host_mem_util_pct"),
+        ("node_power","Node","host","node_power","W","node_power_w","node_power_w"),
+    ]
+    dcu_specs=[
+        ("dcu_util","dcu_utilization","%","util_pct"),
+        ("vram_used","vram_used","GiB","mem_used_mib"),
+        ("vram_util","vram_utilization","%","mem_util_pct"),
+        ("dcu_power","dcu_power","W","power_w"),
+        ("dcu_temp","dcu_temperature","C","temp_c"),
+    ]
+
+    def scopes_for(node,elapsed):
+        scopes=["full"]
+        if _phase_for_elapsed(elapsed,shared_steady)=="steady":scopes.append("shared")
+        if _phase_for_elapsed(elapsed,node_steady.get(node,{}))=="steady":scopes.append("per-node")
+        return scopes
+
+    def convert(row):
+        node=row.get("node"); elapsed=_csv_float(row,"elapsed_s")
+        timing={"timestamp":row.get("timestamp"),"elapsed_s":elapsed,"role":row.get("role"),"node":node,
+                "route_state":row.get("route_state"),"route_event":row.get("route_event")}
+        host={**timing,"cpu_util_pct":_csv_float(row,"cpu_util_pct"),
+              "cpu_freq_avg_mhz":_csv_float(row,"cpu_freq_avg_mhz"),"cpu_freq_max_mhz":_csv_float(row,"cpu_freq_max_mhz"),
+              "cpu_temp_avg_c":_csv_float(row,"cpu_temp_avg_c"),"cpu_temp_max_c":_csv_float(row,"cpu_temp_max_c"),
+              "cpu_power_w":_csv_float(row,"cpu_power_w"),"host_mem_util_pct":_csv_float(row,"host_mem_util_pct"),
+              "host_mem_used_gib":((_csv_float(row,"host_mem_used_mib") or 0)/1024 if _csv_float(row,"host_mem_used_mib") is not None else None),
+              "node_power_w":_csv_float(row,"node_power_w")}
+        cards=[]
+        for index in range(4):
+            prefix="dcu%d_"%index
+            values={key:_csv_float(row,prefix+field) for key,field in (
+                ("dcu_util_pct","util_pct"),("dcu_mem_used_gib","mem_used_mib"),("dcu_mem_total_gib","mem_total_mib"),
+                ("dcu_mem_util_pct","mem_util_pct"),("dcu_power_w","power_w"),("dcu_temp_c","temp_c"))}
+            if values["dcu_mem_used_gib"] is not None:values["dcu_mem_used_gib"]/=1024
+            if values["dcu_mem_total_gib"] is not None:values["dcu_mem_total_gib"]/=1024
+            if any(value is not None for value in values.values()):cards.append({**timing,"dcu_index":index,**values})
+        return host,cards
+
+    with open(path,"r",newline="",encoding="utf-8-sig") as stream:
+        for row in csv.DictReader(stream):
+            node=row.get("node"); elapsed=_csv_float(row,"elapsed_s")
+            if node not in roles or elapsed is None:continue
+            scopes=scopes_for(node,elapsed)
+            for key,category,device,metric,unit,avg_field,max_field in host_specs:
+                average=_csv_float(row,avg_field); maximum=_csv_float(row,max_field)
+                if key=="memory_used":
+                    if average is not None:average/=1024
+                    if maximum is not None:maximum/=1024
+                for scope in scopes:update(stats,(node,scope,key),average,maximum)
+                update(summary_stats,(node,category,device,metric,unit),average,maximum)
+            powers=[]
+            for index in range(4):
+                for dashboard_key,metric,unit,suffix in dcu_specs:
+                    value=_csv_float(row,"dcu%d_%s"%(index,suffix))
+                    if dashboard_key=="vram_used" and value is not None:value/=1024
+                    if dashboard_key!="vram_used":
+                        for scope in scopes:update(stats,(node,scope,dashboard_key),value)
+                    update(summary_stats,(node,"DCU","dcu%d"%index,metric,unit),value)
+                power=_csv_float(row,"dcu%d_power_w"%index)
+                if power is not None:powers.append(power)
+            if powers:
+                total=sum(powers)
+                for scope in scopes:update(stats,(node,scope,"dcu_power_total"),total)
+            if int(elapsed)%stride==0 or elapsed<=1 or elapsed>=total_elapsed-1:
+                host,cards=convert(row); sampled_host[node].append(host); sampled_dcu[node].extend(cards)
+            last_rows[node]=row
+
+    # 如果末行未命中抽样步长，强制补入，保证图表可见完整时间范围。
+    for node,row in last_rows.items():
+        elapsed=_csv_float(row,"elapsed_s")
+        if not sampled_host[node] or sampled_host[node][-1].get("elapsed_s")!=elapsed:
+            host,cards=convert(row); sampled_host[node].append(host); sampled_dcu[node].extend(cards)
+
+    dashboard={node:{} for node in roles}
+    dashboard_keys=("cpu_util","cpu_temp","cpu_power","memory_used","memory_util","dcu_util","vram_util","dcu_power_total","dcu_temp","node_power")
+    for node in roles:
+        for scope in ("full","shared","per-node"):
+            dashboard[node][scope]={}
+            for key in dashboard_keys:
+                count,total,maximum=stats.get((node,scope,key),(0,0.0,None))
+                dashboard[node][scope][key]=(total/count if count else None,maximum)
+
+    summary=[]
+    host_order=[spec[1:5] for spec in host_specs]
+    for node,role in roles.items():
+        ordered=list(host_order)+[("DCU","dcu%d"%index,metric,unit) for index in range(4) for _,metric,unit,_ in dcu_specs]
+        for category,device,metric,unit in ordered:
+            count,total,maximum=summary_stats.get((node,category,device,metric,unit),(0,0.0,None))
+            summary.append({"role":role,"node":node,"category":category,"device":device,"metric":metric,"unit":unit,
+                            "samples":count,"average":round(total/count,4) if count else "",
+                            "maximum":round(maximum,4) if maximum is not None else ""})
+    return sampled_host,sampled_dcu,summary,dashboard,stride
 
 
 def make_node_svg(path,model,role,node,host_rows,dcu_rows,events,started,steady=None):
@@ -1540,16 +1687,17 @@ def _dashboard_manual_series(host_rows,dcu_rows):
     return {"max_elapsed_s":max(elapsed_values) if elapsed_values else 0.0,"metrics":series,"charts":charts}
 
 
-def make_dashboard(path,model,node_infos,full_host,full_dcu,shared_host,shared_dcu,node_host,node_dcu,shared_steady,node_steady,started):
+def make_dashboard(path,model,node_infos,full_host,full_dcu,shared_host,shared_dcu,node_host,node_dcu,shared_steady,node_steady,started,precomputed_metrics=None):
     role_order=[]; overview=[]
     for role,node,full_svg,shared_svg,node_svg in node_infos:
         if role not in role_order:role_order.append(role)
-        overview.append({"role":role,"node":node,"full_svg":full_svg,"shared_svg":shared_svg,"node_svg":node_svg,
-                         "metrics":{
+        metrics=(precomputed_metrics.get(node) if precomputed_metrics else None) or {
                              "full":_dashboard_node_metrics(full_host.get(node,[]),full_dcu.get(node,[])),
                              "shared":_dashboard_node_metrics(shared_host.get(node,[]),shared_dcu.get(node,[])),
                              "per-node":_dashboard_node_metrics(node_host.get(node,[]),node_dcu.get(node,[])),
-                         }})
+                         }
+        overview.append({"role":role,"node":node,"full_svg":full_svg,"shared_svg":shared_svg,"node_svg":node_svg,
+                         "metrics":metrics})
     metric_defs=[
         ("cpu_util","CPU利用率","%"),("cpu_temp","CPU温度","°C"),("cpu_power","CPU功耗","W"),
         ("memory_used","内存占用","GiB"),("memory_util","内存利用率","%"),
@@ -1796,8 +1944,12 @@ def main():
     stamp=datetime.now().strftime("%Y%m%d_%H%M%S"); outdir=Path(args.output_dir)/(safe_model+"_run_"+stamp); outdir.mkdir(parents=True)
     cfg["model_name"]=model; (outdir/"effective_config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=2),encoding="utf-8")
     q=queue.Queue(); stop=threading.Event(); started=time.time(); threads=[]; node_threads=[]; seen=set(); route_state="unknown"
-    events=[]; event_seq=0; tagged={node:0 for node in roles}; host_rows={node:[] for node in roles}; dcu_rows={node:[] for node in roles}
-    one_second_rows={node:[] for node in roles}
+    events=deque(maxlen=max(100,int(cfg.get("route_event_memory_limit",1000)))); event_seq=0; tagged={node:0 for node in roles}
+    runtime_seconds=max(60,int(cfg.get("runtime_memory_window_s",300)))
+    interval=max(1,float(cfg.get("sample_interval_s",1))); runtime_samples=max(60,int(math.ceil(runtime_seconds/interval)))
+    expected_cards=max(1,int(cfg.get("expected_dcu_cards_per_node",4)))
+    host_rows={node:deque(maxlen=runtime_samples) for node in roles}
+    dcu_rows={node:deque(maxlen=runtime_samples*expected_cards) for node in roles}
     node_health={node:{"last_received":None,"dcu_count":None,"last_error":"","util_received":None,"util_error":""} for node in roles}
     latest_active={}; node_time_bases={}
     signal.signal(signal.SIGINT,lambda *_:stop.set())
@@ -1891,7 +2043,7 @@ def main():
             one_second=complete_row(wide_sample,node,role,started,"unclassified")
             one_second.update({**timing,"role":role,"node":node,"route_state":route_state,"route_event":route_event,
                                "phase":"unclassified","shared_phase":"unclassified","node_phase":"unclassified"})
-            one_second_rows[node].append(one_second); cluster_one_second_writer.writerow(one_second)
+            cluster_one_second_writer.writerow(one_second)
             for card in sample.get("dcus",[]):
                 # 配置了独立利用率命令时沿用其结果；否则直接使用主 hy-smi
                 # 命令中的 showuse。后者与基础指标同轮采集，不会阻塞 4 秒。
@@ -1925,38 +2077,38 @@ def main():
                 print("[节点检查] %s | %s"%(label,"; ".join(cards_by_role)),flush=True)
                 first_packet_check_printed=True
     stop.set(); ended=time.time(); total_elapsed=round(ended-started,3)
-    shared_steady=detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed); shared_steady["scope"]="shared"
-    node_steady=detect_node_steady_states(cfg,roles,dcu_rows,total_elapsed)
+    metrics_path=outdir/"metrics_1s.csv"
+    util_series=load_util_series(metrics_path,roles)
+    shared_steady=detect_steady_state(cfg,mode,active_groups,{},total_elapsed,util_series); shared_steady["scope"]="shared"
+    node_steady=detect_node_steady_states(cfg,roles,{},total_elapsed,util_series)
+    del util_series
+    report_points=max(100,int(cfg.get("report_max_points_per_node",3600)))
+    host_rows,dcu_rows,all_full_summary,dashboard_metrics,report_stride=build_report_from_csv(
+        metrics_path,roles,shared_steady,node_steady,total_elapsed,report_points)
     mark_phases(host_rows,dcu_rows,shared_steady,"phase"); mark_phases(host_rows,dcu_rows,shared_steady,"shared_phase")
     mark_node_phases(host_rows,dcu_rows,node_steady)
-    mark_phases(one_second_rows,{},shared_steady,"phase"); mark_phases(one_second_rows,{},shared_steady,"shared_phase")
-    mark_node_phases(one_second_rows,{},node_steady)
     shared_host={node:steady_rows(rows,shared_steady) for node,rows in host_rows.items()}
     shared_dcu={node:steady_rows(rows,shared_steady) for node,rows in dcu_rows.items()}
     node_host={node:steady_rows(rows,node_steady[node]) for node,rows in host_rows.items()}
     node_dcu={node:steady_rows(rows,node_steady[node]) for node,rows in dcu_rows.items()}
     full_scope={"scope":"full","status":"full_run","start_elapsed_s":0.0,"end_elapsed_s":total_elapsed}
-    all_shared_summary=[]; all_node_summary=[]; all_full_summary=[]; node_infos=[]
+    node_infos=[]
     for node,role in roles.items():
         ndir=outdir/role/node
-        shared_summary=build_node_summary(role,node,shared_host[node],shared_dcu[node])
-        per_node_summary=build_node_summary(role,node,node_host[node],node_dcu[node])
-        full_summary=build_node_summary(role,node,host_rows[node],dcu_rows[node])
-        all_shared_summary.extend(shared_summary); all_node_summary.extend(per_node_summary); all_full_summary.extend(full_summary)
         make_node_svg(ndir/"visualization.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,shared_steady)
         make_node_svg(ndir/"visualization_per_node.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,node_steady[node])
         make_node_svg(ndir/"visualization_full.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,full_scope)
         node_infos.append((role,node,"%s/%s/visualization_full.svg"%(role,node),"%s/%s/visualization.svg"%(role,node),"%s/%s/visualization_per_node.svg"%(role,node)))
     # CSV 交付只保留逐秒宽表与全程汇总；稳态口径由 HTML 和 steady_state.json 提供。
     write_csv(outdir/"summary.csv",SUMMARY_FIELDS,all_full_summary)
-    cluster_one_second_rows=[row for node in roles for row in one_second_rows[node]]
-    cluster_one_second_rows.sort(key=lambda row:(int(row.get("elapsed_s",0)),str(row.get("node",""))))
-    write_csv(outdir/"metrics_1s.csv",ONE_SECOND_FIELDS,cluster_one_second_rows)
-    make_dashboard(outdir/"dashboard.html",model,node_infos,host_rows,dcu_rows,shared_host,shared_dcu,node_host,node_dcu,shared_steady,node_steady,started)
+    make_dashboard(outdir/"dashboard.html",model,node_infos,host_rows,dcu_rows,shared_host,shared_dcu,node_host,node_dcu,
+                   shared_steady,node_steady,started,dashboard_metrics)
     steady_report={**shared_steady,"shared":shared_steady,"per_node":node_steady}
     (outdir/"steady_state.json").write_text(json.dumps(steady_report,ensure_ascii=False,indent=2),encoding="utf-8")
     metadata={"model_name":model,"deployment_mode":mode,"started_at":iso_time(started),"ended_at":iso_time(ended),"duration_s":total_elapsed,
-              "nodes":roles,"route_events":events,"steady_state":steady_report}
+              "nodes":roles,"route_events":list(events),"steady_state":steady_report,
+              "storage":{"mode":"streaming_csv","runtime_memory_window_s":runtime_seconds,
+                         "report_max_points_per_node":report_points,"report_downsample_stride_s":report_stride}}
     (outdir/"run_metadata.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
     if shared_steady.get("start_elapsed_s") is not None:
         auto_note=("（AUTO比较P/D后选中%s）"%shared_steady.get("auto_selected_group") if shared_steady.get("auto_selected_group") else "")

@@ -1,4 +1,7 @@
+import csv
+import tempfile
 import unittest
+from pathlib import Path
 
 import cluster_monitor as monitor
 
@@ -30,6 +33,7 @@ class ClusterMonitorTests(unittest.TestCase):
         self.assertNotIn("node_timestamp", monitor.ONE_SECOND_FIELDS)
         self.assertNotIn("received_timestamp", monitor.ONE_SECOND_FIELDS)
         self.assertNotIn("node_clock_offset_s", monitor.ONE_SECOND_FIELDS)
+        self.assertNotIn("phase", monitor.ONE_SECOND_FIELDS)
 
     def test_combined_hy_smi_output_is_parsed(self):
         raw = (
@@ -72,6 +76,33 @@ class ClusterMonitorTests(unittest.TestCase):
         self.assertEqual(row["dcu0_util_pct"], 0.0)
         self.assertEqual(row["dcu3_util_pct"], 30.0)
         self.assertEqual(row["dcu3_power_w"], 103.0)
+
+    def test_csv_report_is_exact_but_plot_points_are_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics_1s.csv"
+            with path.open("w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.DictWriter(stream, fieldnames=monitor.ONE_SECOND_FIELDS)
+                writer.writeheader()
+                for elapsed in range(1, 1001):
+                    row = {field: "" for field in monitor.ONE_SECOND_FIELDS}
+                    row.update({"timestamp": "2026-08-10T00:00:00+08:00", "elapsed_s": elapsed,
+                                "role": "P", "node": "p1c0", "cpu_util_pct": elapsed - 1})
+                    for card in range(4):
+                        row["dcu%d_util_pct" % card] = card * 10
+                        row["dcu%d_power_w" % card] = 100 + card
+                    writer.writerow(row)
+            none = {"start_elapsed_s": None, "end_elapsed_s": None}
+            host, dcu, summary, dashboard, stride = monitor.build_report_from_csv(
+                path, {"p1c0": "P"}, none, {"p1c0": none}, 1000, 100)
+            self.assertEqual(stride, 10)
+            self.assertLessEqual(len(host["p1c0"]), 102)
+            self.assertLessEqual(len(dcu["p1c0"]), 102 * 4)
+            cpu = next(row for row in summary if row["node"] == "p1c0" and row["metric"] == "cpu_utilization")
+            self.assertEqual(cpu["samples"], 1000)
+            self.assertEqual(cpu["average"], 499.5)
+            self.assertEqual(cpu["maximum"], 999.0)
+            self.assertEqual(dashboard["p1c0"]["full"]["cpu_util"], (499.5, 999.0))
+            self.assertEqual(len(monitor.load_util_series(path, {"p1c0": "P"})["p1c0"]), 1000)
 
 if __name__ == "__main__":
     unittest.main()
