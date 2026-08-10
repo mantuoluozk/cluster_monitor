@@ -58,6 +58,13 @@ COMPLETE_FIELDS = ["timestamp","elapsed_s","node","role","phase",*NODE_METRICS,
     "ib_rx_packets_total_s","ib_tx_link_util_max_pct","ib_rx_link_util_max_pct",
     "ib_error_delta_total","ib_ports_json","error"]
 
+# 面向用户直接检查逐秒数据：每个节点每秒一行，四张 DCU 横向展开。
+# timestamp 是唯一业务时间戳；elapsed_s 仅是从本次监控开始计算的秒序号。
+_ONE_SECOND_PREFIX = ["timestamp","elapsed_s","role","node",
+                      "route_state","route_event","phase","shared_phase","node_phase"]
+ONE_SECOND_FIELDS = _ONE_SECOND_PREFIX + [field for field in COMPLETE_FIELDS
+                                          if field not in _ONE_SECOND_PREFIX and field!="ib_ports_json"]
+
 # 面向日常查看的必需指标窄表。字段名直接携带单位，不受 metrics 输出开关裁剪。
 CORE_FIELDS = [
     "timestamp", "elapsed_s", "node", "role", "phase",
@@ -333,12 +340,65 @@ auto_cpu_temperature() {
   done
   [ "$found" -gt 0 ] && awk -v total="$total" -v count="$found" -v maximum="$maximum" 'BEGIN {printf "%.3f %.3f",total/count,maximum}'
 }
-last_dcu_mem=0; last_node_power=0; last_cpu_power=0; last_cpu_temp=0; last_dcu_temp=0
+last_dcu_mem=0; last_cpu_temp=0; last_dcu_temp=0
 dcu_mem_raw=''; power_raw=''; cpu_power_raw=''; cpu_temp_raw=''; dcu_temp_raw=''
+work_dir=$(mktemp -d /tmp/cluster-monitor.XXXXXX) || exit 1
+
+# IPMI 响应偶尔会超过 1 秒。独立刷新功耗缓存，不能让 BMC 抖动拖慢主采样。
+refresh_worker() {
+  kind="$1"; cmd="$2"; refresh_interval="$3"; output="$4"; initial_delay="$5"
+  [ "$initial_delay" = "0" ] || sleep "$initial_delay"
+  while :; do
+    refresh_started=$(date +%s.%N)
+    if [ "$kind" = "auto_cpu_power" ]; then new_raw=$(auto_cpu_power 2>&1); command_status=$?
+    else new_raw=$(sh -c "$cmd" 2>&1); command_status=$?
+    fi
+    if [ "$command_status" -eq 0 ]; then
+      printf '%s' "$new_raw" >"$output.new" && mv -f "$output.new" "$output"
+    fi
+    refresh_ended=$(date +%s.%N)
+    refresh_wait=$(awk -v interval="$refresh_interval" -v started="$refresh_started" -v ended="$refresh_ended" 'BEGIN {v=interval-(ended-started); if(v>0)printf "%.6f",v}')
+    [ -n "$refresh_wait" ] && sleep "$refresh_wait"
+  done
+}
+worker_pids=''
+if [ -n "$power_cmd" ]; then refresh_worker command "$power_cmd" "$node_power_interval" "$work_dir/power_cache" 0 & worker_pids="$worker_pids $!"; fi
+# 错开两个 BMC 请求，降低同一管理控制器串行处理造成的延迟。
+if [ -n "$cpu_power_cmd" ]; then
+  if [ "$cpu_power_cmd" = "auto" ]; then worker_kind=auto_cpu_power; else worker_kind=command; fi
+  refresh_worker "$worker_kind" "$cpu_power_cmd" "$cpu_power_interval" "$work_dir/cpu_power_cache" 0.5 & worker_pids="$worker_pids $!"
+fi
+cleanup() {
+  [ -z "$worker_pids" ] || kill $worker_pids 2>/dev/null
+  [ -z "$worker_pids" ] || wait $worker_pids 2>/dev/null
+  rm -rf "$work_dir"
+}
+trap cleanup EXIT
+trap 'exit 0' HUP INT TERM
 while :; do
+  loop_started=$(date +%s.%N)
   now_s=$(date +%s)
   ts=$(date +%s.%N)
   printf '@BEGIN\t%s\n' "$ts"
+
+  # 厂商工具的独立查询并发执行；BMC 查询由上面的后台刷新器处理。
+  (sh -c "$dcu_cmd" >"$work_dir/dcu" 2>&1) & dcu_pid=$!
+  dcu_mem_pid=''; dcu_temp_pid=''; cpu_temp_pid=''
+  if [ -n "$dcu_mem_cmd" ] && [ $((now_s-last_dcu_mem)) -ge "$dcu_mem_interval" ]; then
+    (sh -c "$dcu_mem_cmd" >"$work_dir/dcu_mem" 2>&1) & dcu_mem_pid=$!; last_dcu_mem=$now_s
+  fi
+  if [ -n "$dcu_temp_cmd" ] && [ $((now_s-last_dcu_temp)) -ge "$dcu_temp_interval" ]; then
+    (sh -c "$dcu_temp_cmd" >"$work_dir/dcu_temp" 2>&1) & dcu_temp_pid=$!; last_dcu_temp=$now_s
+  fi
+  if [ -n "$cpu_temp_cmd" ] && [ $((now_s-last_cpu_temp)) -ge "$cpu_temp_interval" ]; then
+    if [ "$cpu_temp_cmd" = "auto" ]; then
+      (auto_cpu_temperature >"$work_dir/cpu_temp" 2>&1) & cpu_temp_pid=$!
+    else
+      (sh -c "$cpu_temp_cmd" >"$work_dir/cpu_temp" 2>&1) & cpu_temp_pid=$!
+    fi
+    last_cpu_temp=$now_s
+  fi
+
   awk '/^cpu / {printf "@CPU"; for(i=2;i<=9;i++) printf "\t%s",$i; printf "\n"; exit}' /proc/stat
   awk -F: '/^[[:space:]]*cpu MHz/ {v=$2+0; total+=v; count++; if(v>maximum)maximum=v} END {if(count)printf "@CPUFREQ\t%.3f\t%.3f\n",total/count,maximum}' /proc/cpuinfo
   awk '
@@ -347,33 +407,18 @@ while :; do
     /^SwapTotal:/ {st=$2} /^SwapFree:/ {sf=$2}
     END {if(!ma)ma=mf; printf "@MEM\t%s\t%s\t%s\t%s\t%s\n",mt,ma,ca+sr,st,sf}' /proc/meminfo
   awk '{printf "@LOAD\t%s\t%s\t%s\n",$1,$2,$3}' /proc/loadavg
-  dcu_raw=$(sh -c "$dcu_cmd" 2>&1); printf '@DCU\t'; printf '%s' "$dcu_raw" | b64; printf '\n'
-  if [ -n "$dcu_mem_cmd" ] && [ $((now_s-last_dcu_mem)) -ge "$dcu_mem_interval" ]; then
-    new_raw=$(sh -c "$dcu_mem_cmd" 2>&1); command_status=$?; last_dcu_mem=$now_s
-    [ "$command_status" -eq 0 ] && dcu_mem_raw=$new_raw
-  fi
+
+  wait "$dcu_pid"; dcu_raw=$(cat "$work_dir/dcu" 2>/dev/null)
+  printf '@DCU\t'; printf '%s' "$dcu_raw" | b64; printf '\n'
+  if [ -n "$dcu_mem_pid" ] && wait "$dcu_mem_pid"; then dcu_mem_raw=$(cat "$work_dir/dcu_mem" 2>/dev/null); fi
   printf '@DCUMEM\t'; printf '%s' "$dcu_mem_raw" | b64; printf '\n'
-  if [ -n "$dcu_temp_cmd" ] && [ $((now_s-last_dcu_temp)) -ge "$dcu_temp_interval" ]; then
-    new_raw=$(sh -c "$dcu_temp_cmd" 2>&1); command_status=$?; last_dcu_temp=$now_s
-    [ "$command_status" -eq 0 ] && dcu_temp_raw=$new_raw
-  fi
+  if [ -n "$dcu_temp_pid" ] && wait "$dcu_temp_pid"; then dcu_temp_raw=$(cat "$work_dir/dcu_temp" 2>/dev/null); fi
   printf '@DCUTEMP\t'; printf '%s' "$dcu_temp_raw" | b64; printf '\n'
-  if [ -n "$power_cmd" ] && [ $((now_s-last_node_power)) -ge "$node_power_interval" ]; then
-    new_raw=$(sh -c "$power_cmd" 2>&1); command_status=$?; last_node_power=$now_s
-    [ "$command_status" -eq 0 ] && power_raw=$new_raw
-  fi
+  [ ! -r "$work_dir/power_cache" ] || power_raw=$(cat "$work_dir/power_cache" 2>/dev/null)
   printf '@POWER\t'; printf '%s' "$power_raw" | b64; printf '\n'
-  if [ -n "$cpu_power_cmd" ] && [ $((now_s-last_cpu_power)) -ge "$cpu_power_interval" ]; then
-    if [ "$cpu_power_cmd" = "auto" ]; then new_raw=$(auto_cpu_power); command_status=$?; else new_raw=$(sh -c "$cpu_power_cmd" 2>&1); command_status=$?; fi
-    [ "$command_status" -eq 0 ] && cpu_power_raw=$new_raw
-    last_cpu_power=$now_s
-  fi
+  [ ! -r "$work_dir/cpu_power_cache" ] || cpu_power_raw=$(cat "$work_dir/cpu_power_cache" 2>/dev/null)
   printf '@CPUPOWER\t'; printf '%s' "$cpu_power_raw" | b64; printf '\n'
-  if [ -n "$cpu_temp_cmd" ] && [ $((now_s-last_cpu_temp)) -ge "$cpu_temp_interval" ]; then
-    if [ "$cpu_temp_cmd" = "auto" ]; then new_raw=$(auto_cpu_temperature); command_status=$?; else new_raw=$(sh -c "$cpu_temp_cmd" 2>&1); command_status=$?; fi
-    [ "$command_status" -eq 0 ] && cpu_temp_raw=$new_raw
-    last_cpu_temp=$now_s
-  fi
+  if [ -n "$cpu_temp_pid" ] && wait "$cpu_temp_pid"; then cpu_temp_raw=$(cat "$work_dir/cpu_temp" 2>/dev/null); fi
   printf '@CPUTEMP\t'; printf '%s' "$cpu_temp_raw" | b64; printf '\n'
   for hpath in /sys/class/infiniband/*; do
     [ -d "$hpath" ] || continue; hca=${hpath##*/}
@@ -390,7 +435,10 @@ while :; do
     done
   done
   printf '@END\n'
-  sleep "$interval"
+  # 采样周期按相邻两轮的开始时间计算，避免命令耗时叠加到 interval 上。
+  loop_ended=$(date +%s.%N)
+  wait_s=$(awk -v interval="$interval" -v started="$loop_started" -v ended="$loop_ended" 'BEGIN {v=interval-(ended-started); if(v>0)printf "%.6f",v}')
+  [ -n "$wait_s" ] && sleep "$wait_s"
 done
 '''
 
@@ -556,10 +604,10 @@ def load_config(path, nodes_override=None):
     cfg=json.loads(strip_json_comments(Path(path).read_text(encoding="utf-8")))
     cfg["metrics"]={**DEFAULT_METRICS,**cfg.get("metrics",{})}
     try:
-        base=int(cfg.get("sample_interval_s",2))
+        base=int(cfg.get("sample_interval_s",1))
         if base<=0:raise ValueError
         cfg["sample_interval_s"]=base
-        for key,default in (("dcu_memory_interval_s",10),("dcu_utilization_interval_s",5),("dcu_temperature_interval_s",5),("node_power_interval_s",5),("cpu_power_interval_s",5),("cpu_temperature_interval_s",5)):
+        for key,default in (("dcu_memory_interval_s",1),("dcu_utilization_interval_s",1),("dcu_temperature_interval_s",1),("node_power_interval_s",1),("cpu_power_interval_s",1),("cpu_temperature_interval_s",1)):
             value=int(cfg.get(key,default))
             if value<=0:raise ValueError
             # 远端循环只能在基础样本时刻执行命令，小于基础周期没有实际意义。
@@ -721,8 +769,8 @@ def spawn_dcu_util(node,cfg,outq,stop):
 
 
 def rows_for_sample(sample, node, role, started, phase, err=""):
-    base={"timestamp":datetime.fromtimestamp(sample.get("ts",time.time()),timezone.utc).astimezone().isoformat(timespec="milliseconds"),
-          "elapsed_s":round(time.time()-started,3),"node":node,"role":role,"phase":phase,
+    base={"timestamp":datetime.fromtimestamp(sample.get("ts",time.time()),timezone.utc).astimezone().isoformat(timespec="seconds"),
+          "elapsed_s":elapsed_second(time.time(),started),"node":node,"role":role,"phase":phase,
           **{k:sample.get(k) for k in ["cpu_util_pct","cpu_user_pct","cpu_system_pct","cpu_iowait_pct","cpu_power_w",
              "load_1m","load_5m","load_15m","host_mem_used_mib","host_mem_available_mib",
              "host_mem_cache_mib","host_mem_util_pct","swap_used_mib","swap_util_pct"]},
@@ -739,14 +787,14 @@ def rows_for_sample(sample, node, role, started, phase, err=""):
 
 
 def ib_rows_for_sample(sample, node, role, started, phase):
-    base={"timestamp":datetime.fromtimestamp(sample.get("ts",time.time()),timezone.utc).astimezone().isoformat(timespec="milliseconds"),
-          "elapsed_s":round(time.time()-started,3),"node":node,"role":role,"phase":phase}
+    base={"timestamp":datetime.fromtimestamp(sample.get("ts",time.time()),timezone.utc).astimezone().isoformat(timespec="seconds"),
+          "elapsed_s":elapsed_second(time.time(),started),"node":node,"role":role,"phase":phase}
     return [{**base,**port} for port in sample.get("ib",[])]
 
 
 def complete_row(sample, node, role, started, phase):
-    row={"timestamp":datetime.fromtimestamp(sample.get("ts",time.time()),timezone.utc).astimezone().isoformat(timespec="milliseconds"),
-         "elapsed_s":round(time.time()-started,3),"node":node,"role":role,"phase":phase,
+    row={"timestamp":datetime.fromtimestamp(sample.get("ts",time.time()),timezone.utc).astimezone().isoformat(timespec="seconds"),
+         "elapsed_s":elapsed_second(time.time(),started),"node":node,"role":role,"phase":phase,
          **{k:sample.get(k) for k in NODE_METRICS},"error":sample.get("error","")}
     cards=sample.get("dcus",[]); row["dcu_count"]=len(cards)
     def sum_present(items,key):
@@ -1050,27 +1098,33 @@ def legacy_main():
 
 
 HOST_FIELDS = [
-    "timestamp","node_timestamp","node_clock_offset_s","elapsed_s","role","node","route_state","route_event","phase","shared_phase","node_phase",
+    "timestamp","elapsed_s","role","node","route_state","route_event","phase","shared_phase","node_phase",
     "cpu_util_pct","cpu_user_pct","cpu_system_pct","cpu_iowait_pct","cpu_freq_avg_mhz","cpu_freq_max_mhz",
     "cpu_temp_avg_c","cpu_temp_max_c","cpu_power_w",
     "host_mem_used_gib","host_mem_total_gib","host_mem_util_pct","node_power_w","error",
 ]
 
 NODE_DCU_FIELDS = [
-    "timestamp","node_timestamp","node_clock_offset_s","elapsed_s","role","node","route_state","route_event","phase","shared_phase","node_phase","dcu_index",
+    "timestamp","elapsed_s","role","node","route_state","route_event","phase","shared_phase","node_phase","dcu_index",
     "dcu_util_pct","dcu_util_sample_age_s","dcu_mem_used_gib","dcu_mem_total_gib","dcu_mem_util_pct",
     "dcu_power_w","dcu_temp_c","dcu_temp_edge_c","dcu_temp_junction_c","dcu_temp_mem_c","dcu_temp_core_c","error",
 ]
 
 ROUTE_EVENT_FIELDS = [
-    "timestamp","confirmed_timestamp","elapsed_s","host","port","state","event","detail",
+    "timestamp","elapsed_s","host","port","state","event","detail",
 ]
 
 SUMMARY_FIELDS = ["role","node","category","device","metric","unit","samples","average","maximum"]
 
 
 def iso_time(ts):
-    return datetime.fromtimestamp(ts,timezone.utc).astimezone().isoformat(timespec="milliseconds")
+    """输出秒级 ISO 8601 时间戳，供全部 CSV/JSON 结果统一使用。"""
+    return datetime.fromtimestamp(ts,timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def elapsed_second(ts,started):
+    """将相对运行时间四舍五入到整秒，避免 CSV 混入毫秒粒度。"""
+    return int(math.floor(max(0.0,float(ts)-float(started))+.5))
 
 
 def probe_route(cfg,outq,stop,started):
@@ -1102,7 +1156,7 @@ def probe_route(cfg,outq,stop,started):
         if should_emit:
             observed=streak_started if state is not None else checked
             event={"timestamp":iso_time(observed),"confirmed_timestamp":iso_time(checked),
-                   "elapsed_s":round(observed-started,3),"host":host,"port":port,"state":kind,
+                   "elapsed_s":elapsed_second(observed,started),"host":host,"port":port,"state":kind,
                    "event":("initial_"+kind if state is None else kind),"detail":last_detail}
             state=kind; outq.put(("__route__",event,None))
         stop.wait(interval)
@@ -1115,7 +1169,7 @@ def _stats(values):
 
 
 def _fresh_node_util_snapshots(rows,expected_cards=4):
-    """从重复写入的缓存值中还原 showhcuutil 的真实刷新样本。"""
+    """按利用率的实际测量时间合并同一节点各卡的新鲜样本。"""
     grouped=defaultdict(dict)
     for row in rows:
         util=row.get("dcu_util_pct"); age=row.get("dcu_util_sample_age_s")
@@ -1145,7 +1199,7 @@ def _detect_steady_state_single(cfg,mode,active_groups,dcu_rows,total_elapsed):
     per_node={node:_fresh_node_util_snapshots(dcu_rows.get(node,[]),expected_cards) for node in nodes}
     if any(not samples for samples in per_node.values()):
         result["reason"]="参考组存在没有有效 DCU 利用率样本的节点"; return result
-    anchor=max(nodes,key=lambda node:len(per_node[node])); tolerance=max(1.5,float(cfg.get("dcu_utilization_interval_s",5))*.45)
+    anchor=max(nodes,key=lambda node:len(per_node[node])); tolerance=max(1.5,float(cfg.get("dcu_utilization_interval_s",1))*.45)
     series=[]
     for elapsed,util in per_node[anchor]:
         values=[util]; times=[elapsed]; complete=True
@@ -1229,8 +1283,8 @@ def detect_steady_state(cfg,mode,active_groups,dcu_rows,total_elapsed):
         if not active_groups.get(role):continue
         role_cfg={**cfg,"steady_state":{**settings,"reference_group":role}}
         candidates[role]=_detect_steady_state_single(role_cfg,mode,active_groups,dcu_rows,total_elapsed)
-    minimum_duration=max(float(cfg.get("dcu_utilization_interval_s",5)),
-                         (int(settings.get("window_fresh_samples",6))-1)*float(cfg.get("dcu_utilization_interval_s",5)))
+    minimum_duration=max(float(cfg.get("dcu_utilization_interval_s",1)),
+                         (int(settings.get("window_fresh_samples",6))-1)*float(cfg.get("dcu_utilization_interval_s",1)))
     valid={role:result for role,result in candidates.items()
            if result.get("start_confirmed") and float(result.get("duration_s") or 0)>=minimum_duration}
     if valid:
@@ -1478,7 +1532,7 @@ def _dashboard_manual_series(host_rows,dcu_rows):
         {"label":"CPU功耗","unit":"W","series":[{"label":"CPU","points":host_points("cpu_power_w")}]},
         {"label":"内存利用率","unit":"%","series":[{"label":"内存","points":host_points("host_mem_util_pct")}]},
         {"label":"整机功耗","unit":"W","series":[{"label":"整机","points":host_points("node_power_w")}]},
-        {"label":"DCU利用率（最近1秒HCU活跃占比）","unit":"%","series":card_lines("dcu_util_pct")},
+        {"label":"DCU利用率","unit":"%","series":card_lines("dcu_util_pct")},
         {"label":"DCU显存利用率","unit":"%","series":card_lines("dcu_mem_util_pct")},
         {"label":"DCU功耗","unit":"W","series":card_lines("dcu_power_w")},
         {"label":"DCU温度","unit":"°C","series":card_lines("dcu_temp_c")},
@@ -1585,7 +1639,7 @@ def make_dashboard(path,model,node_infos,full_host,full_dcu,shared_host,shared_d
 <section id="overview" class="section"><div class="section-head"><h2>节点汇总矩阵</h2><p><span class="scope-content" data-scope="full">使用脚本全程全部有效样本</span><span class="scope-content" data-scope="shared">所有节点使用同一个稳态区间</span><span class="scope-content" data-scope="per-node">每个节点使用自己检测出的稳态区间</span><span class="scope-content" data-scope="manual">使用页面中手动指定的区间</span>；表中为平均值 / 最大值</p></div><div class="table-wrap"><table><thead><tr><th>角色 / 节点</th>__TABLE_HEADER__</tr></thead><tbody>__TABLE_ROWS__</tbody></table></div></section>
 <section id="compare" class="section"><div class="section-head"><h2>跨节点关键指标</h2><p>彩色条为平均值，橙色菱形为最大值</p></div><div class="compare-grid">__COMPARE_CARDS__</div></section>
 <section id="details" class="section"><div class="section-head"><h2>单节点完整时间曲线</h2><p>一次显示一个节点，保持原图文字清晰</p></div><div class="detail-controls"><div class="role-tabs">__ROLE_BUTTONS__</div>__NODE_TABS__</div>__DETAIL_PANELS__</section>
-<footer>自动与手动区间只改变统计范围，不会改写原始 CSV。路由端口事件单独标记，DCU利用率统一采用最近1秒 HCU active ratio。</footer></main>
+<footer>自动与手动区间只改变统计范围，不会改写原始 CSV。路由端口事件单独标记，DCU利用率按配置的采集来源记录。</footer></main>
 <script type="application/json" id="manual-data">__MANUAL_DATA__</script>
 <script>(function(){
 const data=JSON.parse(document.getElementById('manual-data').textContent),nodes=Object.keys(data.nodes),scopeButtons=[...document.querySelectorAll('[data-select-scope]')],scopeContents=[...document.querySelectorAll('.scope-content')],roleButtons=[...document.querySelectorAll('.role-tab')],nodeGroups=[...document.querySelectorAll('.node-tabs')],nodeButtons=[...document.querySelectorAll('.node-tab')],panels=[...document.querySelectorAll('.detail-panel')],manualPanel=document.getElementById('manual-panel'),nodeField=document.getElementById('manual-node-field'),nodeSelect=document.getElementById('manual-node'),startInput=document.getElementById('manual-start'),endInput=document.getElementById('manual-end'),startRange=document.getElementById('manual-start-range'),endRange=document.getElementById('manual-end-range'),rangeShell=document.getElementById('manual-range-shell'),previewSvg=document.getElementById('manual-preview-svg'),previewLegend=document.getElementById('manual-preview-legend'),previewMode=document.getElementById('manual-preview-mode'),status=document.getElementById('manual-status'),summary=document.getElementById('manual-summary');
@@ -1647,8 +1701,8 @@ def resolve_deployment_groups(cfg):
 def node_health_text(roles,node_health,cfg,now,started):
     """汇总监控采集链路健康度；不依据模型负载或利用率高低判断。"""
     expected=int(cfg.get("expected_dcu_cards_per_node",4))
-    sample_timeout=max(10.0,float(cfg.get("sample_interval_s",2))*4)
-    util_interval=float(cfg.get("dcu_utilization_interval_s",5))
+    sample_timeout=max(10.0,float(cfg.get("sample_interval_s",1))*4)
+    util_interval=float(cfg.get("dcu_utilization_interval_s",1))
     util_timeout=max(15.0,util_interval*3)
     util_grace=max(10.0,util_interval*2+2)
     reasons={}; healthy_by_role=defaultdict(int); total_by_role=defaultdict(int)
@@ -1688,7 +1742,7 @@ def runtime_steady_status(cfg,mode,active_groups,roles,dcu_rows,total_elapsed):
     expected=max(1,int(cfg.get("expected_dcu_cards_per_node",4)))
     node_series={node:_fresh_node_util_snapshots(dcu_rows.get(node,[]),expected) for node in roles}
     available=all(node_series.get(node) for node in roles)
-    util_fresh_limit=max(15.0,float(cfg.get("dcu_utilization_interval_s",5))*3)
+    util_fresh_limit=max(15.0,float(cfg.get("dcu_utilization_interval_s",1))*3)
     current=available and all(total_elapsed-series[-1][0]<=util_fresh_limit for series in node_series.values())
     latest_values={node:series[-1][1] for node,series in node_series.items() if series}
     latest_avg=(sum(latest_values.values())/len(latest_values) if latest_values else None)
@@ -1743,23 +1797,24 @@ def main():
     cfg["model_name"]=model; (outdir/"effective_config.json").write_text(json.dumps(cfg,ensure_ascii=False,indent=2),encoding="utf-8")
     q=queue.Queue(); stop=threading.Event(); started=time.time(); threads=[]; node_threads=[]; seen=set(); route_state="unknown"
     events=[]; event_seq=0; tagged={node:0 for node in roles}; host_rows={node:[] for node in roles}; dcu_rows={node:[] for node in roles}
+    one_second_rows={node:[] for node in roles}
     node_health={node:{"last_received":None,"dcu_count":None,"last_error":"","util_received":None,"util_error":""} for node in roles}
-    latest_active={}
+    latest_active={}; node_time_bases={}
     signal.signal(signal.SIGINT,lambda *_:stop.set())
     print("模型名称: %s\n输出目录: %s\n部署模式: %s\n节点分组: %s"%(model,outdir,mode,"; ".join("%s=[%s]"%(r,", ".join(ns)) for r,ns in active_groups.items())),flush=True)
     probe=cfg.get("route_probe",{})
     if probe.get("enabled",False):print("路由端口监控: %s:%s，每 %ss 探测一次"%(probe.get("host"),probe.get("port"),probe.get("interval_s",1)),flush=True)
     else:print("路由端口监控: 未启用",flush=True)
     with contextlib.ExitStack() as stack:
-        handles={}; writers={}
         for node,role in roles.items():
             ndir=outdir/role/node; ndir.mkdir(parents=True)
-            host_stream=stack.enter_context(open(ndir/"host.csv","w",newline="",encoding="utf-8-sig"))
-            dcu_stream=stack.enter_context(open(ndir/"dcu_cards.csv","w",newline="",encoding="utf-8-sig"))
-            hw=csv.DictWriter(host_stream,fieldnames=HOST_FIELDS); dw=csv.DictWriter(dcu_stream,fieldnames=NODE_DCU_FIELDS)
-            hw.writeheader(); dw.writeheader(); handles[node]=(host_stream,dcu_stream); writers[node]=(hw,dw)
-        event_stream=stack.enter_context(open(outdir/"route_events.csv","w",newline="",encoding="utf-8-sig"))
-        event_writer=csv.DictWriter(event_stream,fieldnames=ROUTE_EVENT_FIELDS); event_writer.writeheader()
+        cluster_one_second_stream=stack.enter_context(open(outdir/"metrics_1s.csv","w",newline="",encoding="utf-8-sig"))
+        cluster_one_second_writer=csv.DictWriter(cluster_one_second_stream,fieldnames=ONE_SECOND_FIELDS,extrasaction="ignore")
+        cluster_one_second_writer.writeheader()
+        event_stream=None; event_writer=None
+        if probe.get("enabled",False):
+            event_stream=stack.enter_context(open(outdir/"route_events.csv","w",newline="",encoding="utf-8-sig"))
+            event_writer=csv.DictWriter(event_stream,fieldnames=ROUTE_EVENT_FIELDS,extrasaction="ignore"); event_writer.writeheader()
         for node in roles:
             thread=threading.Thread(target=spawn_node,args=(node,cfg,q,stop),daemon=True); thread.start(); threads.append(thread); node_threads.append(thread)
             if cfg.get("dcu_utilization_command"):
@@ -1796,7 +1851,8 @@ def main():
                 continue
             if node=="__route__":
                 if sample is None:print("[路由端口] "+str(err),file=sys.stderr,flush=True); continue
-                route_state=sample["state"]; events.append(sample); event_seq+=1; event_writer.writerow(sample); event_stream.flush()
+                route_state=sample["state"]; events.append(sample); event_seq+=1
+                if event_writer:event_writer.writerow(sample); event_stream.flush()
                 print("[路由端口] %s %s:%s，观测=%s，确认=%s"%(sample["state"],sample["host"],sample["port"],sample["timestamp"],sample["confirmed_timestamp"]),flush=True)
                 continue
             if sample is None:
@@ -1807,11 +1863,16 @@ def main():
                 supplemental=[]
                 for card in active["cards"]:supplemental.append({"index":card.get("index"),"active_util_pct":card.get("util_pct")})
                 sample["dcus"]=merge_dcu_cards(sample.get("dcus",[]),supplemental)
-            role=roles[node]; seen.add(node); received=time.time(); node_ts=sample.get("ts",received); elapsed=round(received-started,3)
+            role=roles[node]; seen.add(node); received=time.time(); node_ts=sample.get("ts",received)
+            if node not in node_time_bases:
+                initial_elapsed=elapsed_second(received,started)
+                node_time_bases[node]=node_ts-initial_elapsed
+            elapsed=elapsed_second(node_ts,node_time_bases[node])
+            aligned_ts=started+elapsed
             node_health[node].update({"last_received":received,"dcu_count":len(sample.get("dcus",[])),"last_error":str(sample.get("error","") or "")})
             route_event=""
             if event_seq>tagged[node] and events:route_event=events[-1]["event"]; tagged[node]=event_seq
-            timing={"timestamp":iso_time(received),"node_timestamp":iso_time(node_ts),"node_clock_offset_s":round(node_ts-received,6),"elapsed_s":elapsed}
+            timing={"timestamp":iso_time(aligned_ts),"elapsed_s":elapsed}
             host_row={**timing,"role":role,"node":node,"route_state":route_state,"route_event":route_event,
                       "phase":"unclassified","shared_phase":"unclassified","node_phase":"unclassified",
                       "cpu_util_pct":sample.get("cpu_util_pct"),"cpu_user_pct":sample.get("cpu_user_pct"),"cpu_system_pct":sample.get("cpu_system_pct"),
@@ -1820,19 +1881,34 @@ def main():
                       "cpu_power_w":sample.get("cpu_power_w"),"host_mem_used_gib":sample.get("host_mem_used_mib")/1024 if sample.get("host_mem_used_mib") is not None else None,
                       "host_mem_total_gib":sample.get("host_mem_total_mib")/1024 if sample.get("host_mem_total_mib") is not None else None,
                       "host_mem_util_pct":sample.get("host_mem_util_pct"),"node_power_w":sample.get("node_power_w"),"error":sample.get("error","")}
-            hw,dw=writers[node]; host_rows[node].append(host_row); hw.writerow(host_row)
+            host_rows[node].append(host_row)
+            normalized_cards=[]
             for card in sample.get("dcus",[]):
+                normalized=dict(card)
+                normalized["util_pct"]=card.get("active_util_pct") if active else card.get("util_pct")
+                normalized_cards.append(normalized)
+            wide_sample={**sample,"dcus":normalized_cards}
+            one_second=complete_row(wide_sample,node,role,started,"unclassified")
+            one_second.update({**timing,"role":role,"node":node,"route_state":route_state,"route_event":route_event,
+                               "phase":"unclassified","shared_phase":"unclassified","node_phase":"unclassified"})
+            one_second_rows[node].append(one_second); cluster_one_second_writer.writerow(one_second)
+            for card in sample.get("dcus",[]):
+                # 配置了独立利用率命令时沿用其结果；否则直接使用主 hy-smi
+                # 命令中的 showuse。后者与基础指标同轮采集，不会阻塞 4 秒。
+                util_value=card.get("active_util_pct") if active else card.get("util_pct")
+                util_age=(round(received-active["received"],3) if active
+                          else round(max(0.0,received-node_ts),3) if util_value is not None else None)
                 drow={**timing,"role":role,"node":node,"route_state":route_state,"route_event":route_event,
                       "phase":"unclassified","shared_phase":"unclassified","node_phase":"unclassified",
-                      "dcu_index":card.get("index"),"dcu_util_pct":card.get("active_util_pct"),
-                      "dcu_util_sample_age_s":round(received-active["received"],3) if active else None,
+                      "dcu_index":card.get("index"),"dcu_util_pct":util_value,
+                      "dcu_util_sample_age_s":util_age,
                       "dcu_mem_used_gib":card.get("mem_used_mib")/1024 if card.get("mem_used_mib") is not None else None,
                       "dcu_mem_total_gib":card.get("mem_total_mib")/1024 if card.get("mem_total_mib") is not None else None,
                       "dcu_mem_util_pct":card.get("mem_util_pct"),"dcu_power_w":card.get("power_w"),"dcu_temp_c":card.get("temp_c"),
                       "dcu_temp_edge_c":card.get("temp_edge_c"),"dcu_temp_junction_c":card.get("temp_junction_c"),
                       "dcu_temp_mem_c":card.get("temp_mem_c"),"dcu_temp_core_c":card.get("temp_core_c"),"error":sample.get("error","")}
-                dcu_rows[node].append(drow); dw.writerow(drow)
-            handles[node][0].flush(); handles[node][1].flush()
+                dcu_rows[node].append(drow)
+            cluster_one_second_stream.flush()
             if len(host_rows[node])==1:
                 card_count=len(sample.get("dcus",[])); expected_cards=int(cfg.get("expected_dcu_cards_per_node",4))
                 print("[%s/%s] 首包: DCU=%d, CPU温度=%s, CPU功耗=%s, 整机功耗=%s"%(role,node,card_count,
@@ -1853,6 +1929,8 @@ def main():
     node_steady=detect_node_steady_states(cfg,roles,dcu_rows,total_elapsed)
     mark_phases(host_rows,dcu_rows,shared_steady,"phase"); mark_phases(host_rows,dcu_rows,shared_steady,"shared_phase")
     mark_node_phases(host_rows,dcu_rows,node_steady)
+    mark_phases(one_second_rows,{},shared_steady,"phase"); mark_phases(one_second_rows,{},shared_steady,"shared_phase")
+    mark_node_phases(one_second_rows,{},node_steady)
     shared_host={node:steady_rows(rows,shared_steady) for node,rows in host_rows.items()}
     shared_dcu={node:steady_rows(rows,shared_steady) for node,rows in dcu_rows.items()}
     node_host={node:steady_rows(rows,node_steady[node]) for node,rows in host_rows.items()}
@@ -1861,24 +1939,19 @@ def main():
     all_shared_summary=[]; all_node_summary=[]; all_full_summary=[]; node_infos=[]
     for node,role in roles.items():
         ndir=outdir/role/node
-        write_csv(ndir/"host.csv",HOST_FIELDS,host_rows[node]); write_csv(ndir/"dcu_cards.csv",NODE_DCU_FIELDS,dcu_rows[node])
         shared_summary=build_node_summary(role,node,shared_host[node],shared_dcu[node])
         per_node_summary=build_node_summary(role,node,node_host[node],node_dcu[node])
         full_summary=build_node_summary(role,node,host_rows[node],dcu_rows[node])
         all_shared_summary.extend(shared_summary); all_node_summary.extend(per_node_summary); all_full_summary.extend(full_summary)
-        # summary.csv 与 visualization.svg 继续代表统一口径，兼容已有分析流程。
-        write_csv(ndir/"summary.csv",SUMMARY_FIELDS,shared_summary)
-        write_csv(ndir/"shared_summary.csv",SUMMARY_FIELDS,shared_summary)
-        write_csv(ndir/"per_node_summary.csv",SUMMARY_FIELDS,per_node_summary)
-        write_csv(ndir/"full_summary.csv",SUMMARY_FIELDS,full_summary)
         make_node_svg(ndir/"visualization.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,shared_steady)
         make_node_svg(ndir/"visualization_per_node.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,node_steady[node])
         make_node_svg(ndir/"visualization_full.svg",model,role,node,host_rows[node],dcu_rows[node],events,started,full_scope)
         node_infos.append((role,node,"%s/%s/visualization_full.svg"%(role,node),"%s/%s/visualization.svg"%(role,node),"%s/%s/visualization_per_node.svg"%(role,node)))
-    write_csv(outdir/"summary.csv",SUMMARY_FIELDS,all_shared_summary)
-    write_csv(outdir/"shared_summary.csv",SUMMARY_FIELDS,all_shared_summary)
-    write_csv(outdir/"per_node_summary.csv",SUMMARY_FIELDS,all_node_summary)
-    write_csv(outdir/"full_summary.csv",SUMMARY_FIELDS,all_full_summary)
+    # CSV 交付只保留逐秒宽表与全程汇总；稳态口径由 HTML 和 steady_state.json 提供。
+    write_csv(outdir/"summary.csv",SUMMARY_FIELDS,all_full_summary)
+    cluster_one_second_rows=[row for node in roles for row in one_second_rows[node]]
+    cluster_one_second_rows.sort(key=lambda row:(int(row.get("elapsed_s",0)),str(row.get("node",""))))
+    write_csv(outdir/"metrics_1s.csv",ONE_SECOND_FIELDS,cluster_one_second_rows)
     make_dashboard(outdir/"dashboard.html",model,node_infos,host_rows,dcu_rows,shared_host,shared_dcu,node_host,node_dcu,shared_steady,node_steady,started)
     steady_report={**shared_steady,"shared":shared_steady,"per_node":node_steady}
     (outdir/"steady_state.json").write_text(json.dumps(steady_report,ensure_ascii=False,indent=2),encoding="utf-8")
@@ -1888,10 +1961,10 @@ def main():
     if shared_steady.get("start_elapsed_s") is not None:
         auto_note=("（AUTO比较P/D后选中%s）"%shared_steady.get("auto_selected_group") if shared_steady.get("auto_selected_group") else "")
         steady_text="%.1fs–%.1fs，持续%.1fs，参考组%s%s，结束%s"%(shared_steady["start_elapsed_s"],shared_steady["end_elapsed_s"],shared_steady["duration_s"],shared_steady.get("reference_group"),auto_note,"已确认" if shared_steady.get("end_confirmed") else "未确认")
-    else:steady_text="未检测到（稳态汇总为空，请查看 full_summary.csv）"
+    else:steady_text="未检测到（可在 dashboard.html 中查看全程或手动选择区间）"
     node_detected=sum(1 for result in node_steady.values() if result.get("start_elapsed_s") is not None)
-    print("\n监控结束，共 %.1fs。\n统一稳态区间: %s\n每节点独立稳态: 已检测 %d/%d 个节点\n统一口径汇总: %s\n独立口径汇总: %s\n全程汇总: %s\n可视化入口: %s"%(
-          total_elapsed,steady_text,node_detected,len(node_steady),outdir/"shared_summary.csv",outdir/"per_node_summary.csv",outdir/"full_summary.csv",outdir/"dashboard.html"),flush=True)
+    print("\n监控结束，共 %.1fs。\n统一稳态区间: %s\n每节点独立稳态: 已检测 %d/%d 个节点\n逐秒数据: %s\n全程汇总: %s\n可视化入口: %s"%(
+          total_elapsed,steady_text,node_detected,len(node_steady),outdir/"metrics_1s.csv",outdir/"summary.csv",outdir/"dashboard.html"),flush=True)
 
 
 if __name__=="__main__": main()

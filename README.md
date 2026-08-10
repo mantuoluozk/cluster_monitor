@@ -4,10 +4,12 @@
 
 一次运行会保留从脚本启动到结束的全部原始数据，并在结束后生成：
 
-- 按 P、D、IFB 和节点分类的 CSV
-- 全程、统一稳态、每节点独立稳态三套统计结果
+- 全集群每节点每秒一行的 `metrics_1s.csv`
+- 一份全程统计 `summary.csv`
 - 支持手动截取稳态区间的单页 HTML 仪表盘
 - 平均值、最大值以及服务端口可达性标记
+
+CSV 只有一个绝对时间戳 `timestamp`（例如 `2026-08-10T21:30:15+08:00`），严格按秒递增。它适用于同一行的所有 CPU、内存、DCU 和 IB 指标。`elapsed_s` 是从本次监控开始计算的整数秒序号，用于画图和区间统计，不是另一个时间戳。采集调度内部仍使用高精度时钟，网络抖动不会让业务时间轴跳秒。
 
 ## 页面预览
 
@@ -133,7 +135,7 @@ HTML 顶部提供四种口径：
 - 窗口平均利用率达到活跃阈值，且前后变化不超过阈值时，认为窗口稳定。
 - 连续多个窗口稳定后确认进入稳态，并向前回溯到首个稳定样本。
 - 利用率连续多个真实样本低于空闲阈值后确认结束，并排除下降过程。
-- 程序只使用 `hy-smi --showhcuutil` 真正刷新的样本，不把复用的缓存值重复用于判稳。
+- 程序按利用率的实际测量时间合并同一节点各卡数据，不把复用的缓存值重复用于判稳。
 
 具体阈值都集中在 `monitor_config.jsonc` 的 `steady_state` 区域。自动检测不到稳态时，全程数据仍正常展示。
 
@@ -168,26 +170,19 @@ HTML 顶部提供四种口径：
 ```text
 results/DeepSeek-V3_run_YYYYMMDD_HHMMSS/
 ├── dashboard.html              # 单页可视化入口
-├── full_summary.csv            # 完整生命周期汇总
-├── shared_summary.csv          # 统一稳态汇总
-├── per_node_summary.csv        # 每节点独立稳态汇总
-├── summary.csv                 # 统一稳态汇总的兼容名称
+├── metrics_1s.csv              # 全集群逐秒宽表；每节点每秒一行，四卡横向展开
+├── summary.csv                 # 完整监控周期的平均值、最大值
 ├── steady_state.json           # 稳态区间、候选组和利用率样本
-├── route_events.csv            # 服务端口状态事件
+├── route_events.csv            # 仅在启用服务端口探测时生成
 ├── effective_config.json       # 本次运行的实际配置
 ├── run_metadata.json
 ├── P/
 │   └── p1c0/
-│       ├── host.csv            # CPU、内存、整机功耗
-│       ├── dcu_cards.csv       # 四张 DCU 的逐卡数据
-│       ├── full_summary.csv
-│       ├── shared_summary.csv
-│       ├── per_node_summary.csv
-│       └── visualization*.svg
+│       └── visualization*.svg  # HTML 使用的节点图表
 └── D/...
 ```
 
-IFB 模式会生成 `IFB/` 目录。所有 CSV 均包含时间戳；汇总表中的平均值和最大值按对应统计口径计算。
+IFB 模式会生成 `IFB/` 目录。`metrics_1s.csv` 中每行的 `timestamp` 同时对应该行所有指标；`summary.csv` 不是时序数据，因此不重复保存时间戳。
 
 ## 查看结果
 
@@ -234,8 +229,8 @@ ssh -p {SSH_PORT} {USER}@{JUMP_HOST} "ss -ltnp | grep ':18080 '"
 | `deployment.groups` | P、D、IFB 节点列表 |
 | `expected_dcu_cards_per_node` | 每个节点预期 DCU 数量 |
 | `monitor_duration_s` | `0` 表示运行到 `Ctrl+C` |
-| `sample_interval_s` | 基础指标采样周期 |
-| `dcu_utilization_interval_s` | DCU 利用率真实刷新周期 |
+| `sample_interval_s` | 基础指标固定采样节拍，默认 1 秒；命令耗时会从等待时间中扣除 |
+| `dcu_utilization_interval_s` | 仅在配置独立 DCU 利用率命令时使用，默认 1 秒 |
 | `steady_state.reference_group` | PD 下可用 `auto`、`P` 或 `D` |
 | `steady_state.window_fresh_samples` | 稳态窗口的真实样本数 |
 | `steady_state.confirm_windows` | 连续多少个窗口后确认开始 |
@@ -267,14 +262,12 @@ sudo ipmitool sensor get CPU_POWER | awk '/Sensor Reading/ {print $4; exit}'
 ### DCU
 
 ```bash
-hy-smi --showuse --showmemuse --showpower --json
-hy-smi --showhcuutil
-hy-smi --showmeminfo vram --json
-hy-smi --showtemp --json
+hy-smi --showuse --showmemuse --showpower --showmeminfo vram --showtemp --json
 ```
 
-- `hy-smi --showuse` 返回查询时刻的瞬时 CU 使用率，短脉冲负载可能恰好采到空闲值。
-- DCU 利用率统一使用 `hy-smi --showhcuutil` 的最近 1 秒 HCU active ratio：默认在 1 秒窗口内周期采样 DCU 是否活跃，以活跃采样次数占比表示利用率，更适合推理监控和稳态识别。接口语义可参考海光官方 [HYGON-AI/dcu-dcgm](https://pkg.go.dev/github.com/HYGON-AI/dcu-dcgm/v2/pkg/dcgm#DCUSampledUsage)。
+- DCU 利用率默认使用主命令中的 `hy-smi --showuse`，并在同一次调用中读取显存、功耗和温度。在当前环境组合查询实测约 0.08 秒；它返回查询时刻的瞬时 CU 使用率，极短脉冲负载仍可能恰好采到空闲值。
+- 如需兼容旧口径，可把 `dcu_utilization_command` 配成 `hy-smi --showhcuutil`。它返回最近 1 秒 HCU active ratio，但在当前环境单次约耗时 4 秒，因此无法每秒产生新样本，不适合本次每秒监控需求。
+- DCU 和 CPU 传感器在每个采样周期内并发执行；下一轮等待时间会扣除本轮命令耗时。两个 IPMI 功耗查询使用错开的独立每秒刷新器，BMC 偶发慢响应不会拖慢 CPU、内存、IB 和 DCU 的主采样节拍。
 - 单卡功耗来自 `Average Graphics Package Power (W)`。
 - 显存利用率为 `已用显存 / 总显存 × 100%`。
 - 温度保留 edge、junction、memory、core，汇总默认使用 junction。
